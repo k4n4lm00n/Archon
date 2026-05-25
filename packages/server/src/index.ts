@@ -503,7 +503,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       await zulip.start();
       activePlatforms.push('Zulip');
     } else {
-      getLog().info('zulip_adapter_skipped');
+      getLog().info('zulip.adapter_skipped');
     }
   } else {
     getLog().info('platform_adapters_skipped');
