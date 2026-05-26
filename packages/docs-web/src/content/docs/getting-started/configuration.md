@@ -27,6 +27,26 @@ Set these in your shell or `.env` file:
 | `LOG_LEVEL` | No | `debug`, `info` (default), `warn`, `error` |
 | `PORT` | No | Server port (default: 3090, Docker: 3000) |
 
+## Streaming Modes
+
+Chat adapters support two response-delivery modes, configured per-platform via the `*_STREAMING_MODE` environment variables:
+
+| Mode | Behavior | When to use |
+|------|----------|-------------|
+| `stream` | AI tokens are sent progressively — the bot edits its own message live as text is generated. | When the platform supports real-time message editing (Telegram, Zulip) and you want an interactive feel. |
+| `batch` | The AI completes the full response before sending; a `Starting thinking…` status message gives immediate feedback while the AI works. | More reliable across platforms; recommended as the default. |
+
+**Default modes by platform:**
+
+| Platform | Default |
+|----------|---------|
+| Telegram | `stream` |
+| Discord | `batch` |
+| Slack | `batch` |
+| Zulip | `batch` |
+
+Override per platform via the matching env var (e.g. `ZULIP_STREAMING_MODE=stream`, `TELEGRAM_STREAMING_MODE=batch`).
+
 ## Project Configuration
 
 Create `.archon/config.yaml` in your repository:
