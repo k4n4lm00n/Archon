@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pi model-default fallback** — when no model is set on a workflow node or in `.archon/config.yaml`, the Pi provider now falls back to the operator's own Pi default (`defaultProvider`/`defaultModel` in `~/.pi/agent/settings.json`, as written by the `pi` CLI). This keeps Pi workflows model-agnostic — no vendor model hardcoded — so setups whose catalog drifts (e.g. a LiteLLM proxy) work without pinning a specific model, mirroring how the standalone `pi` CLI boots. Falls through to the existing explicit "requires a model" error when no default is configured.
+
 ## [0.7.0] - 2026-08-01
 
 Runtime sub-runs (`workflow:`), the connected Studio builder, usage accounting you can trust, a repaired `curl | bash` install path, and a security batch across cloning, transport, and path resolution.
