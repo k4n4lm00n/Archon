@@ -359,11 +359,32 @@ export class PiProvider implements IAgentProvider {
       }
     }
 
-    // 1. Resolve model ref: request (workflow node / chat) → config default
-    const modelRef = requestOptions?.model ?? piConfig.model;
+    // 1. Resolve model ref: request (workflow node / chat) → config default →
+    //    the operator's own Pi default (defaultProvider/defaultModel in
+    //    ~/.pi/agent/settings.json, as written by the `pi` CLI when a model is
+    //    selected). The settings fallback keeps Archon model-agnostic for Pi:
+    //    no vendor model is hardcoded anywhere, and litellm-only setups — whose
+    //    catalog drifts over time — work without pinning a specific model.
+    let modelRef = requestOptions?.model ?? piConfig.model;
+    if (!modelRef) {
+      try {
+        const settings = piCodingAgent.SettingsManager.create(cwd).getGlobalSettings();
+        const provider = settings.defaultProvider?.trim();
+        const modelId = settings.defaultModel?.trim();
+        if (provider && modelId) {
+          modelRef = `${provider}/${modelId}`;
+          getLog().info({ modelRef }, 'pi.model_defaulted_from_settings');
+        }
+      } catch (err) {
+        // Non-fatal: settings.json may be absent (user never ran `pi`) or
+        // unreadable. Fall through to the explicit "requires a model" error.
+        getLog().debug({ err }, 'pi.settings_default_model_read_failed');
+      }
+    }
     if (!modelRef) {
       throw new Error(
-        'Pi provider requires a model. Set `model` on the workflow node or `assistants.pi.model` in .archon/config.yaml. ' +
+        'Pi provider requires a model. Set `model` on the workflow node or `assistants.pi.model` in .archon/config.yaml, ' +
+          'or select a default model in the `pi` CLI (writes defaultProvider/defaultModel to ~/.pi/agent/settings.json). ' +
           "Format: '<pi-provider-id>/<model-id>' (e.g. 'google/gemini-2.5-pro')."
       );
     }
@@ -374,12 +395,12 @@ export class PiProvider implements IAgentProvider {
       );
     }
 
-    // 2. Build AuthStorage + ModelRegistry. Both read on every sendQuery —
+    // 2. Build ModelRuntime + ModelRegistry. Both read on every sendQuery —
     //    user edits to auth.json or models.json take effect without restart.
-    //    ModelRegistry.create() is mutable: extension providers can call registerProvider()
-    //    on it during bindExtensions() to add their models (phase 2 resolution).
-    let authStorage: ReturnType<typeof piCodingAgent.AuthStorage.create>;
-    let modelRegistry: ReturnType<typeof piCodingAgent.ModelRegistry.create>;
+    //    ModelRegistry wraps the runtime and is mutable: extension providers can
+    //    call registerProvider() on it during bindExtensions() (phase 2 resolution).
+    let modelRuntime: Awaited<ReturnType<typeof piCodingAgent.ModelRuntime.create>>;
+    let modelRegistry: InstanceType<typeof piCodingAgent.ModelRegistry>;
     try {
       // Archon delivers per-user credentials (API keys + subscriptions) as a
       // per-run auth.json and points us at it via ARCHON_PI_AUTH_PATH — using an
@@ -391,8 +412,12 @@ export class PiProvider implements IAgentProvider {
       const archonAuthPath =
         (requestOptions?.env?.ARCHON_PI_AUTH_PATH ?? process.env.ARCHON_PI_AUTH_PATH)?.trim() ||
         undefined;
-      authStorage = piCodingAgent.AuthStorage.create(archonAuthPath);
-      modelRegistry = piCodingAgent.ModelRegistry.create(authStorage);
+      // 0.83.0: ModelRuntime.create({ authPath }) replaces AuthStorage.create();
+      // ModelRegistry is now constructed from the runtime (was ModelRegistry.create(authStorage)).
+      modelRuntime = await piCodingAgent.ModelRuntime.create(
+        archonAuthPath ? { authPath: archonAuthPath } : undefined
+      );
+      modelRegistry = new piCodingAgent.ModelRegistry(modelRuntime);
     } catch (err) {
       const e = err as Error;
       getLog().error({ err: e, piProvider: parsed.provider }, 'pi.auth_storage_init_failed');
@@ -436,7 +461,8 @@ export class PiProvider implements IAgentProvider {
       name ? (requestOptions?.env?.[name] ?? process.env[name]) : undefined;
     const envOverride = readEnvOverride(oauthVarName) ?? readEnvOverride(envVarName);
     if (envOverride) {
-      authStorage.setRuntimeApiKey(parsed.provider, envOverride);
+      // 0.83.0: setRuntimeApiKey moved to ModelRuntime and is async.
+      await modelRuntime.setRuntimeApiKey(parsed.provider, envOverride);
     }
 
     // Auth validation deferred for extension providers — they manage credentials
@@ -446,9 +472,11 @@ export class PiProvider implements IAgentProvider {
     // detection in step 4c; for 'anthropic' we resolve even when the model is
     // deferred to extensions (AuthStorage reads are cheap and side-effect-free)
     // so a catalog miss can never skip the OAuth-safe default prompt.
-    let resolvedKey: Awaited<ReturnType<typeof authStorage.getApiKey>> | undefined;
+    // 0.83.0: AuthStorage.getApiKey → ModelRegistry.getApiKeyForProvider
+    // (same contract: resolves auth.json + runtime overrides to a bearer string).
+    let resolvedKey: Awaited<ReturnType<typeof modelRegistry.getApiKeyForProvider>> | undefined;
     if (model || parsed.provider === 'anthropic') {
-      resolvedKey = await authStorage.getApiKey(parsed.provider);
+      resolvedKey = await modelRegistry.getApiKeyForProvider(parsed.provider);
     }
     if (model) {
       if (!resolvedKey) {
@@ -739,8 +767,7 @@ export class PiProvider implements IAgentProvider {
       // createAgentSession accepts this — the model will be set via
       // session.setModel() after bindExtensions() resolves it (step 4g).
       ...(model ? { model } : {}),
-      authStorage,
-      modelRegistry,
+      modelRuntime,
       sessionManager,
       settingsManager,
       resourceLoader,
@@ -794,6 +821,14 @@ export class PiProvider implements IAgentProvider {
     // 4g. [LOOKUP-2] Re-check the registry after bindExtensions() for extension-registered models.
     //     Safe to call session.setModel() here — no prompt has been sent yet.
     if (!model) {
+      // Extension providers register via ModelRuntime.registerProvider(), which
+      // ends with a FIRE-AND-FORGET `void this.refresh()` — the reload of the
+      // model store is not awaited by the SDK. ModelRegistry documents: "Reload
+      // models.json asynchronously. Await before making synchronous registry
+      // reads." find() below is synchronous, so without this await the extension
+      // provider's models (e.g. a litellm proxy catalog) may not be in the
+      // snapshot yet and resolution races to a spurious "model not found".
+      await modelRegistry.refresh();
       model = modelRegistry.find(parsed.provider, parsed.modelId);
       if (!model) {
         session.dispose();

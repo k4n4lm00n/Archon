@@ -1,0 +1,115 @@
+# E2E smoke test — Pi community provider via a LiteLLM proxy backend.
+# Verifies: Archon resolves an EXTENSION-provided (pi-provider-litellm) model
+#   and streams a real response — WITHOUT hardcoding any model id. The model is
+#   the operator's own Pi default (defaultProvider/defaultModel in
+#   ~/.pi/agent/settings.json), so this smoke survives LiteLLM catalog drift:
+#   when the available models change, update your `pi` default and the smoke
+#   follows. This exercises two Archon paths a hardcoded smoke cannot:
+#     1. Pi model-default fallback (no `model:` field anywhere).
+#     2. Extension-provider model resolution (bindExtensions -> registry.refresh
+#        -> find) — the litellm/kiro/etc. code path.
+# Prereqs: the `pi-provider-litellm` extension installed (`pi install
+#   npm:pi-provider-litellm`), a litellm entry in ~/.pi/agent/auth.json, and
+#   litellm selected as your Pi default model. No env vars, no anthropic key.
+# Design: mirrors e2e-pi-smoke / e2e-minimax-smoke. Node 1 gates on the litellm
+#   prereqs so the smoke fails LOUD and actionable when the environment isn't
+#   set up, instead of a cryptic model-not-found deep in the Pi node.
+name: e2e-pi-litellm
+description: |
+  Use when: Verifying that Archon resolves and calls a LiteLLM-proxy model via
+            the Pi community provider using the operator's local Pi default —
+            no hardcoded model id (survives LiteLLM catalog drift).
+  Triggers: "litellm smoke", "test litellm", "verify litellm", "pi litellm test".
+  Does: Gates on litellm prereqs, sends one tiny prompt using the Pi default
+        model, asserts a non-empty response, and confirms litellm routing from
+        the Pi session log.
+  NOT for: Production work — connectivity / capability sanity check only.
+
+provider: pi
+# NOTE: intentionally NO `model:` field. Archon falls back to the operator's Pi
+# default (defaultProvider/defaultModel in ~/.pi/agent/settings.json). Hardcoding
+# a litellm model id here would defeat the purpose — litellm catalogs drift.
+
+worktree:
+  enabled: false # Smoke test — no need to isolate
+
+nodes:
+  # 1. Prereq gate — fail early + actionable if litellm isn't the Pi default or
+  #    has no discovered models. Reads Pi's own settings/model cache (no network).
+  - id: prereqs
+    bash: |
+      set -euo pipefail
+      settings="$HOME/.pi/agent/settings.json"
+      store="$HOME/.pi/agent/models-store.json"
+
+      if [ ! -f "$settings" ]; then
+        echo "FAIL: $settings not found — run \`pi\` and select a litellm model first."
+        exit 1
+      fi
+
+      # `|| true` so a missing key yields an empty var (handled below) rather
+      # than aborting under `set -e` before the friendly message prints.
+      provider=$(grep -oE '"defaultProvider"[[:space:]]*:[[:space:]]*"[^"]*"' "$settings" | sed -E 's/.*"([^"]*)"$/\1/' || true)
+      model=$(grep -oE '"defaultModel"[[:space:]]*:[[:space:]]*"[^"]*"' "$settings" | sed -E 's/.*"([^"]*)"$/\1/' || true)
+      echo "Pi default: provider='$provider' model='$model'"
+
+      if [ "$provider" != "litellm" ]; then
+        echo "FAIL: Pi defaultProvider is '$provider', expected 'litellm'."
+        echo "      Select a litellm model as your default via the \`pi\` CLI."
+        exit 1
+      fi
+      if [ -z "$model" ]; then
+        echo "FAIL: no defaultModel set in $settings."
+        exit 1
+      fi
+      if [ ! -f "$store" ] || ! grep -q '"provider":[[:space:]]*"litellm"' "$store"; then
+        echo "FAIL: no litellm models discovered in $store — open \`pi\` to refresh the litellm catalog."
+        exit 1
+      fi
+      echo "PASS: litellm is the Pi default ('$model') with discovered models."
+
+  # 2. Connectivity — Archon resolves the Pi default (litellm) model and streams.
+  #    No `model:` here: workflow has none, so the provider uses the Pi default.
+  - id: hello
+    prompt: 'What is 2+2? Answer with just the number, nothing else.'
+    allowed_tools: []
+    effort: low
+    idle_timeout: 60000
+    depends_on: [prereqs]
+
+  # 3. Assertions — non-empty output + confirm litellm routing from session log.
+  - id: assert
+    depends_on: [hello]
+    bash: |
+      output="$hello.output"
+      echo "hello = $output"
+      if [ -z "$output" ]; then
+        echo "FAIL: empty output from hello node"
+        exit 1
+      fi
+
+      # Routing proof: Pi writes a session jsonl per call. Any recent one whose
+      # compact JSON shows provider=litellm is sufficient evidence that the
+      # Pi-default fallback routed to litellm (mirrors e2e-minimax-smoke). The
+      # 10-minute window is generous for a slow network; capped by -mmin.
+      recent=$(find "$HOME/.pi/agent/sessions" -name '*.jsonl' -mmin -10 -print 2>/dev/null)
+      if [ -z "$recent" ]; then
+        echo "FAIL: no Pi session jsonl modified in the last 10 minutes"
+        exit 1
+      fi
+      matched=""
+      while IFS= read -r session; do
+        if grep -q '"provider":"litellm"' "$session"; then
+          matched="$session"; break
+        fi
+      done <<< "$recent"
+      if [ -n "$matched" ]; then
+        echo "PASS: Pi session log confirms provider=litellm"
+        echo "      session: $matched"
+      else
+        echo "FAIL: no recent Pi session log confirmed litellm routing — possible misroute"
+        echo "      checked sessions:"
+        echo "$recent" | sed 's/^/        /'
+        exit 1
+      fi
+      echo "PASS: smoke complete"
