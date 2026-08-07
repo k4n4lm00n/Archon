@@ -75,6 +75,8 @@ import { getUserAiPrefs, type UserAiPrefs } from '../db/user-ai-prefs-store';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { createChildWorktreeResolver } from '../workflows/child-isolation-resolver';
 import { loadConfig, loadRepoConfig } from '../config/config-loader';
+import { resolveCommandRewrite } from '@archon/workflows/command-rewrite';
+import { BUILTIN_COMMAND_NAMES } from '@archon/workflows/command-frontmatter';
 import type { MergedConfig } from '../config/config-types';
 import { generateAndSetTitle } from '../services/title-generator';
 import { validateAndResolveIsolation, dispatchBackgroundWorkflow } from './orchestrator';
@@ -1683,23 +1685,28 @@ export async function handleMessage(
 
     // 2. Check for deterministic commands
     if (trimmedMessage.startsWith('/')) {
-      const { command } = commandHandler.parseCommand(message);
-      const deterministicCommands = [
-        'help',
-        'status',
-        'reset',
-        'workflow',
-        'register-project',
-        'update-project',
-        'remove-project',
-        'setproject',
-        'set-chat-mode',
-        'commands',
-        'init',
-        'worktree',
-      ];
+      // Resolve command aliases (`rewrite:` frontmatter) textually, BEFORE the
+      // deterministic-vs-AI gate. An alias never routes to the AI.
+      try {
+        const rewriteCwd = conversation.cwd ?? process.cwd();
+        const rewritten = await resolveCommandRewrite(createWorkflowDeps(), rewriteCwd, message);
+        if (rewritten !== message) {
+          getLog().debug(
+            { conversationId, from: message, to: rewritten },
+            'command.rewrite_resolved'
+          );
+          message = rewritten; // `message` is a reassignable param (no no-param-reassign rule)
+        }
+      } catch (error) {
+        const err = error as Error;
+        getLog().warn({ err, conversationId }, 'command.rewrite_failed');
+        await platform.sendMessage(conversationId, `Command alias error: ${err.message}`);
+        return; // fail loud — do NOT fall through to the AI
+      }
 
-      if (deterministicCommands.includes(command)) {
+      const { command } = commandHandler.parseCommand(message);
+
+      if ((BUILTIN_COMMAND_NAMES as readonly string[]).includes(command)) {
         if (command === 'register-project') {
           getLog().debug({ command, conversationId }, 'deterministic_command');
           const result = await handleRegisterProject(message, platform, conversationId);

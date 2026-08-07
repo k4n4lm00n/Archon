@@ -24,6 +24,7 @@ import { execFileAsync } from '@archon/git';
 import { BUNDLED_COMMANDS, BUNDLED_WORKFLOWS, isBinaryBuild } from './defaults/bundled-defaults';
 import { isValidCommandName } from './command-validation';
 import { levenshtein, findSimilar } from './utils/fuzzy-match';
+import { getRewriteTarget, BUILTIN_COMMAND_NAMES } from './command-frontmatter';
 import {
   claudeSkillSearchRoots,
   findInstalledSkillNames,
@@ -944,10 +945,14 @@ export async function validateCommand(
     return { commandName, valid: false, issues };
   }
 
-  // For non-bundled commands, check file is non-empty
-  if (!resolved.startsWith('[bundled:')) {
+  // Read the command content — from the filesystem for on-disk commands, or from
+  // the embedded bundle for binary builds (so bundled aliases are validated too).
+  let content: string | null = null;
+  if (resolved.startsWith('[bundled:')) {
+    content = BUNDLED_COMMANDS[commandName] ?? null;
+  } else {
     try {
-      const content = await readFile(resolved, 'utf-8');
+      content = await readFile(resolved, 'utf-8');
       if (content.trim().length === 0) {
         issues.push({
           level: 'error',
@@ -964,6 +969,46 @@ export async function validateCommand(
         message: `Cannot read command file '${commandName}': ${err.message}`,
         hint: 'Check file permissions',
       });
+    }
+  }
+
+  // Validate a `rewrite:` alias target (if present) resolves to a built-in or an
+  // existing command file. Typos fail loud at validate time instead of at runtime.
+  if (content !== null) {
+    let rewriteTarget: string | null = null;
+    try {
+      rewriteTarget = getRewriteTarget(content);
+    } catch (e) {
+      issues.push({
+        level: 'error',
+        field: 'rewrite',
+        message: `Command '${commandName}' has an invalid rewrite: target — ${(e as Error).message}`,
+        hint: 'Use a string command with a leading slash, e.g. `rewrite: /help`',
+      });
+    }
+    if (rewriteTarget) {
+      // Leading token of the target (strip slash + any trailing fixed args).
+      const targetName = rewriteTarget.replace(/^\//, '').split(/\s+/)[0] ?? '';
+      const isBuiltin = (BUILTIN_COMMAND_NAMES as readonly string[]).includes(targetName);
+      const targetResolves = isBuiltin || (await resolveCommand(targetName, cwd, config)) !== null;
+      if (!targetResolves) {
+        const available = [
+          ...BUILTIN_COMMAND_NAMES,
+          ...(await discoverAvailableCommands(cwd, config)),
+        ];
+        const similar = findSimilar(targetName, available);
+        const issue: ValidationIssue = {
+          level: 'error',
+          field: 'rewrite',
+          message: `Command '${commandName}' rewrites to '/${targetName}', which does not exist`,
+          hint: `Point rewrite: at a built-in (${BUILTIN_COMMAND_NAMES.join(', ')}) or an existing command file`,
+        };
+        if (similar.length > 0) {
+          issue.hint = `Did you mean: ${similar.map(s => `'/${s}'`).join(', ')}?`;
+          issue.suggestions = similar;
+        }
+        issues.push(issue);
+      }
     }
   }
 

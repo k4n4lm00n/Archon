@@ -57,6 +57,30 @@ Run the tests for the `$ARGUMENTS` module and report what you find.
 
 ---
 
+## Command Aliases: `rewrite:`
+
+A command file can also be a **bash-style alias** for another command. Add a `rewrite:` key to the frontmatter and the file becomes a pure alias — invoking it textually rewrites the message to the target and re-dispatches it. Nothing routes to the AI.
+
+```markdown
+---
+rewrite: /help
+---
+
+# /ahelp — alias for /help
+```
+
+Now `/ahelp foo` behaves exactly like `/help foo`. The rule is simple, matching a shell alias:
+
+- The invoked command token is replaced by the `rewrite:` target.
+- Your trailing arguments are appended **verbatim** — there is no placeholder or positional substitution (`$1`, `$ARGUMENTS` are not expanded inside a `rewrite:` value).
+- The target may be a built-in (`/help`, `/status`, `/workflow`, …) or another command file. A multi-token target like `rewrite: /workflow list` is allowed — the fixed args are kept and yours are appended after them.
+
+Alias chains (an alias pointing at another alias) resolve through to the end, but **cycles fail loud**: a self-loop, an A→B→A loop, or a chain deeper than five hops raises a clear error instead of looping forever. `archon validate commands` also warns at load time when a `rewrite:` target points at a command or built-in that does not exist (with a "did you mean" suggestion).
+
+Archon ships two bundled aliases for exactly this reason — `ahelp` and `archon-help`, both `rewrite: /help`. Some chat clients (Zulip's web client, for example) intercept `/help` before it reaches the bot, so these unswallowed names give you a way to reach the built-in help.
+
+---
+
 ## Build It: A Test Runner Command
 
 Let's build a real command. The goal: run tests for a specific module and report results clearly.
