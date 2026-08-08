@@ -52,7 +52,7 @@ All six `ZULIP_*` variables are documented in `.env.example`. Three are **requir
 | `ZULIP_BOT_API_KEY` | **Yes** | The bot's API key (`key` in `zuliprc`). |
 | `ZULIP_BOT_FULL_NAME` | No (but **recommended**) | The bot's display name — required for `@**Bot Name**` mention detection in streams. Without it, the bot still replies to direct messages but cannot detect @mentions. |
 | `ZULIP_ALLOWED_USER_IDS` | No | Comma-separated numeric Zulip user IDs allowed to interact with the bot. **Unset (or empty) → open access**; set → only listed users are answered. A set-but-malformed value (e.g. non-numeric or all-invalid tokens) is a misconfiguration and the bot will **fail to start** — fail-closed, not fail-open. |
-| `ZULIP_STREAMING_MODE` | No | `batch` (default) — the bot edits a "thinking…" status message and posts the full answer once ready. `stream` streams the answer progressively as it is generated, then posts a closing "Done thinking." line. Toggle live with `/set-chat-mode <batch\|stream>` (global, resets on restart). See [Configuration → Streaming Modes](/getting-started/configuration/) for the cross-platform overview. |
+| `ZULIP_STREAMING_MODE` | No | `batch` (default) — the bot edits a "working…" status message and posts the full answer once ready. `stream` streams the answer progressively as it is generated, then posts a closing "Done working." line. Toggle live with `/set-chat-mode <batch\|stream>` (global, resets on restart). See [Configuration → Streaming Modes](/getting-started/configuration/) for the cross-platform overview. |
 | `ZULIP_STREAM_STYLE` | No | Rendering style when `ZULIP_STREAMING_MODE=stream`: `post` (default) posts progressive multi-message updates with a 2-second coalescing window; `edit` edits a single message in place as tokens arrive. Ignored in `batch` mode. |
 
 Example:
@@ -74,7 +74,9 @@ The bot responds to:
 - **Stream messages** when @mentioned: `@**Archon** help me with this code`. The reply lands in the same stream + topic.
 - **Direct messages** sent to the bot — replies go back as DMs.
 
-A stream + topic pair (or the set of DM recipients) is treated as one conversation. While the bot is "thinking", it edits a `Starting thinking…` status message so you get immediate visual feedback; it switches to `Done thinking.` (or `Done thinking (FAILED).`) when the reply lands.
+A stream + topic pair (or the set of DM recipients) is treated as one conversation. While the bot is working, it edits a `Starting working…` status message so you get immediate visual feedback; it switches to `Done working.` (or `Done working (FAILED).`) when the reply lands. In `stream` mode the turn always ends with a `Done working.` marker (appended to the status message, or posted standalone if no status message was created).
+
+Tool calls and reasoning ("thinking") are rendered as collapsible Zulip **spoiler** blocks — the tool's JSON input and the reasoning text are nested in code fences so they stay compact and monospaced instead of expanding inline.
 
 If you edit your message to *add* the @mention (you forgot it first time), the bot picks that up via Zulip's `update_message` event and replies as if the mention had been there originally.
 

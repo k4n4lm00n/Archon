@@ -193,6 +193,12 @@ export class ZulipAdapter implements IPlatformAdapter {
     // Stream mode: route normal chunks to the coalescing stream-turn handler. Error
     // sends bypass streaming — they post immediately (batch body below) and mark read.
     if (this.streamingMode === 'stream' && !isError) {
+      // Tool calls arrive as BOTH a formatted-text send (this `tool_call_formatted`
+      // chunk) AND a structured event. In stream mode the tool is rendered by
+      // sendStructuredEvent as a collapsible spoiler; streaming the raw formatToolCall
+      // text here would pollute the answer buffer (`turn.rendered`) with tool noise.
+      // Drop it — batch mode (below) still shows the formatToolCall line.
+      if (metadata?.category === 'tool_call_formatted') return;
       await this.handleStreamChunk(conversationId, ctx, text);
       return;
     }
@@ -217,7 +223,7 @@ export class ZulipAdapter implements IPlatformAdapter {
         this.statusLastEdit.delete(conversationId);
       }
 
-      const doneLabel = isError ? 'Done thinking (FAILED).' : 'Done thinking.';
+      const doneLabel = isError ? 'Done working (FAILED).' : 'Done working.';
       const newText = `${statusEntry.text}\n${formatUtcTime()} ${doneLabel}`;
 
       const now = Date.now();
@@ -462,7 +468,7 @@ export class ZulipAdapter implements IPlatformAdapter {
 
   /**
    * Finish-signal for a streamed turn (IPlatformAdapter.finalizeStream). Flushes any
-   * remaining buffered output, posts the closing "Done thinking." status line, marks the
+   * remaining buffered output, posts the closing "Done working." status line, marks the
    * inbound message read (moved here for stream mode), and clears the turn state.
    * Best-effort: logs and never throws.
    */
@@ -493,7 +499,21 @@ export class ZulipAdapter implements IPlatformAdapter {
           }
         }
       }
-      await this.postClosingStatus(conversationId);
+      // Guaranteed end-of-turn marker. If a status message exists, append the closing
+      // line to it; otherwise post a standalone marker so the turn is ALWAYS clearly
+      // terminated (a stream turn where the status message was never created — e.g. a
+      // failed/uncaptured status POST — would otherwise end with no "done" signal).
+      const appended = await this.postClosingStatus(conversationId);
+      if (!appended) {
+        const ctx = this.replyContexts.get(conversationId);
+        if (ctx) {
+          try {
+            await this.postChunk(ctx, `${formatUtcTime()} Done working.`);
+          } catch (error) {
+            getLog().warn({ err: error, conversationId }, 'zulip.closing_marker_post_failed');
+          }
+        }
+      }
       await this.markOldestPendingRead(conversationId);
     } catch (error) {
       getLog().warn({ err: error, conversationId }, 'zulip.finalize_stream_failed');
@@ -503,23 +523,26 @@ export class ZulipAdapter implements IPlatformAdapter {
   }
 
   /**
-   * Append the closing "Done thinking." line to the conversation's status message.
-   * Consumes the same FIFO entry the batch path would; no-op if no status message exists.
+   * Append the closing "Done working." line to the conversation's status message.
+   * Consumes the same FIFO entry the batch path would. Returns `true` if a status
+   * message was edited, `false` if none existed (so finalizeStream can post a
+   * standalone marker instead).
    */
-  private async postClosingStatus(conversationId: string): Promise<void> {
+  private async postClosingStatus(conversationId: string): Promise<boolean> {
     const statusQueue = this.statusMessageQueues.get(conversationId);
-    if (!statusQueue || statusQueue.length === 0) return;
+    if (!statusQueue || statusQueue.length === 0) return false;
     const statusEntry = statusQueue.shift();
     if (statusEntry === undefined) {
       getLog().error({ conversationId }, 'zulip.status_queue_inconsistency');
-      return;
+      return false;
     }
     if (statusQueue.length === 0) {
       this.statusMessageQueues.delete(conversationId);
       this.statusLastEdit.delete(conversationId);
     }
-    const newText = `${statusEntry.text}\n${formatUtcTime()} Done thinking.`;
+    const newText = `${statusEntry.text}\n${formatUtcTime()} Done working.`;
     await this.updateMessage(statusEntry.id, newText);
+    return true;
   }
 
   /**
@@ -530,12 +553,18 @@ export class ZulipAdapter implements IPlatformAdapter {
     try {
       const ctx = this.replyContexts.get(conversationId);
       if (!ctx) return;
+      // A 4-backtick outer spoiler fence lets the payload nest a normal 3-backtick code
+      // block, so the JSON/text renders compact & monospaced inside the collapsible
+      // spoiler instead of as an expanded, double-spaced raw dump.
       let block: string | undefined;
       if (event.type === 'tool') {
         const input = event.toolInput ? JSON.stringify(event.toolInput, null, 2) : '';
-        block = `\`\`\`spoiler 🔧 ${event.toolName}\n${input}\n\`\`\``;
+        if (!input) return; // nothing useful to show — skip empty tool events
+        block = `\`\`\`\`spoiler 🔧 ${event.toolName}\n\`\`\`json\n${input}\n\`\`\`\n\`\`\`\``;
       } else if (event.type === 'thinking') {
-        block = `\`\`\`spoiler 💭 thinking\n${event.content}\n\`\`\``;
+        const content = event.content ?? '';
+        if (!content) return; // skip empty thinking events
+        block = `\`\`\`\`spoiler 💭 thinking\n\`\`\`\n${content}\n\`\`\`\n\`\`\`\``;
       }
       if (!block) return;
       await this.postChunk(ctx, block);
@@ -736,7 +765,7 @@ export class ZulipAdapter implements IPlatformAdapter {
   }
 
   /**
-   * Post the initial "Starting thinking..." status message for a conversation.
+   * Post the initial "Starting working..." status message for a conversation.
    * Captures the returned message_id and pushes it onto the per-conversation FIFO queue.
    * Best-effort: failures are logged and do not block normal message processing.
    */
@@ -744,7 +773,7 @@ export class ZulipAdapter implements IPlatformAdapter {
     const ctx = this.replyContexts.get(conversationId);
     if (!ctx) return;
 
-    const initialText = `${formatUtcTime()} Starting thinking...`;
+    const initialText = `${formatUtcTime()} Starting working...`;
     let response: Record<string, unknown>;
     try {
       if (ctx.type === 'stream') {

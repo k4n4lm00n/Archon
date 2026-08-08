@@ -596,7 +596,7 @@ describe('ZulipAdapter', () => {
         const conv = 'stream:1:topic';
         expect(queues.has(conv)).toBe(true);
         expect(queues.get(conv)![0]!.id).toBe(42);
-        expect(queues.get(conv)![0]!.text).toMatch(/Starting thinking\.\.\./);
+        expect(queues.get(conv)![0]!.text).toMatch(/Starting working\.\.\./);
       } finally {
         delete process.env.ZULIP_BOT_FULL_NAME;
       }
@@ -632,20 +632,20 @@ describe('ZulipAdapter', () => {
         await callHandle(adapter, streamMention());
 
         const statusCall = mockFetch.mock.calls.find(c =>
-          String((c[1] as { body?: unknown }).body).includes('Starting+thinking')
+          String((c[1] as { body?: unknown }).body).includes('Starting+working')
         );
         expect(statusCall).toBeDefined();
         const rawBody = String((statusCall![1] as { body?: unknown }).body);
         const content = new URLSearchParams(rawBody).get('content') ?? '';
         // Must NOT contain a title/header before the timestamp line
         expect(content).not.toMatch(/^#/);
-        expect(content).toMatch(/\d{2}:\d{2}:\d{2} Starting thinking\.\.\./);
+        expect(content).toMatch(/\d{2}:\d{2}:\d{2} Starting working\.\.\./);
       } finally {
         delete process.env.ZULIP_BOT_FULL_NAME;
       }
     });
 
-    test('on success: status edited with "Done thinking." then answer posted separately', async () => {
+    test('on success: status edited with "Done working." then answer posted separately', async () => {
       process.env.ZULIP_BOT_FULL_NAME = 'TestBot';
       try {
         const adapter = new ZulipAdapter('https://test.zulipchat.com', 'bot@test.com', 'key');
@@ -672,7 +672,7 @@ describe('ZulipAdapter', () => {
         const patchBody =
           new URLSearchParams(String((patchCall![1] as { body?: unknown }).body)).get('content') ??
           '';
-        expect(patchBody).toContain('Done thinking.');
+        expect(patchBody).toContain('Done working.');
         expect(patchBody).not.toContain('FAILED');
 
         // Second call should be POST of the actual answer
@@ -696,7 +696,7 @@ describe('ZulipAdapter', () => {
       }
     });
 
-    test('on failure: status edited with "Done thinking (FAILED)." and error posted in place of answer', async () => {
+    test('on failure: status edited with "Done working (FAILED)." and error posted in place of answer', async () => {
       process.env.ZULIP_BOT_FULL_NAME = 'TestBot';
       try {
         const adapter = new ZulipAdapter('https://test.zulipchat.com', 'bot@test.com', 'key');
@@ -720,7 +720,7 @@ describe('ZulipAdapter', () => {
         const patchBody =
           new URLSearchParams(String((patchCall![1] as { body?: unknown }).body)).get('content') ??
           '';
-        expect(patchBody).toContain('Done thinking (FAILED).');
+        expect(patchBody).toContain('Done working (FAILED).');
 
         const errorCall = calls.find(
           c =>
@@ -943,8 +943,8 @@ describe('status-message debounce guard', () => {
         statusMessageQueues: Map<string, Array<{ id: number; text: string }>>;
       }
     ).statusMessageQueues.set('stream:1:T', [
-      { id: 100, text: 'Starting thinking...' },
-      { id: 101, text: 'Starting thinking...' },
+      { id: 100, text: 'Starting working...' },
+      { id: 101, text: 'Starting working...' },
     ]);
     (adapter as unknown as { statusLastEdit: Map<string, number> }).statusLastEdit.set(
       'stream:1:T',
@@ -1107,13 +1107,16 @@ describe('ZulipAdapter stream mode', () => {
       await adapter.finalizeStream('stream:1:T');
 
       const posts = messagePosts();
-      expect(posts.length).toBe(1);
+      // The coalesced answer, plus the guaranteed standalone "Done working." marker
+      // (no status message was created for this bare-adapter turn).
+      expect(posts.length).toBe(2);
       expect(contentOf(posts[0])).toBe('Hello world');
+      expect(contentOf(posts[1])).toContain('Done working.');
       // Turn state is cleared after finalize.
       expect(turnsOf(adapter).has('stream:1:T')).toBe(false);
     });
 
-    test('finalizeStream posts the closing "Done thinking." line and marks read', async () => {
+    test('finalizeStream posts the closing "Done working." line and marks read', async () => {
       process.env.ZULIP_BOT_FULL_NAME = 'TestBot';
       try {
         mockFetch.mockImplementation(() =>
@@ -1152,7 +1155,7 @@ describe('ZulipAdapter stream mode', () => {
         await adapter.finalizeStream('stream:1:topic');
 
         // Closing status line edited into the status message.
-        expect(contentOf(patchTo(500))).toContain('Done thinking.');
+        expect(contentOf(patchTo(500))).toContain('Done working.');
         // Mark-read POST to messages/flags.
         const markRead = mockFetch.mock.calls.find(c =>
           String(c[0]).endsWith('/api/v1/messages/flags')
@@ -1196,7 +1199,7 @@ describe('ZulipAdapter stream mode', () => {
       expect(anyPatch).toBeUndefined();
     });
 
-    test('sendStructuredEvent posts a tool indicator as a spoiler block', async () => {
+    test('sendStructuredEvent wraps tool JSON in a fenced code block inside a spoiler', async () => {
       const adapter = streamAdapter();
       await adapter.sendStructuredEvent('stream:1:T', {
         type: 'tool',
@@ -1206,8 +1209,70 @@ describe('ZulipAdapter stream mode', () => {
       const posts = messagePosts();
       expect(posts.length).toBe(1);
       const content = contentOf(posts[0]);
-      expect(content).toContain('spoiler');
-      expect(content).toContain('Bash');
+      // 4-backtick outer spoiler fence with the tool name as the header.
+      expect(content).toContain('```spoiler 🔧 Bash');
+      // The JSON payload is nested in an inner ```json code fence (renders compact).
+      expect(content).toContain('```json');
+      expect(content).toContain('"command": "ls"');
+    });
+
+    test('sendStructuredEvent skips a tool event with no input (nothing posted)', async () => {
+      const adapter = streamAdapter();
+      await adapter.sendStructuredEvent('stream:1:T', { type: 'tool', toolName: 'Noop' });
+      expect(messagePosts().length).toBe(0);
+    });
+
+    test('stream mode suppresses the raw tool_call_formatted chunk (posts nothing)', async () => {
+      const adapter = streamAdapter();
+      // The orchestrator sends the formatToolCall text with this category alongside the
+      // structured event. In stream mode it must NOT create a chunk message (it would
+      // pollute the answer buffer); the spoiler from sendStructuredEvent is the render.
+      await adapter.sendMessage('stream:1:T', '🔧 Bash', { category: 'tool_call_formatted' });
+      expect(messagePosts().length).toBe(0);
+      // No stream turn buffer was polluted (no turn created, or empty rendered text).
+      const turn = turnsOf(adapter).get('stream:1:T');
+      expect(turn?.rendered ?? '').toBe('');
+    });
+
+    test('finalizeStream posts a standalone "Done working." marker when no status message exists', async () => {
+      const adapter = streamAdapter();
+      // No status message queued for this conversation (createStatusMessage never ran /
+      // failed to capture an id). The turn must still be terminated with a visible marker.
+      await adapter.sendMessage('stream:1:T', 'the answer');
+      mockFetch.mockClear();
+
+      await adapter.finalizeStream('stream:1:T');
+
+      const posts = messagePosts();
+      const marker = posts.find(p => contentOf(p).includes('Done working.'));
+      expect(marker).toBeDefined();
+      // Standalone marker is a fresh POST, not an in-place status edit.
+      const anyStatusPatch = mockFetch.mock.calls.find(
+        c =>
+          /\/api\/v1\/messages\/\d+$/.test(String(c[0])) &&
+          (c[1] as { method?: string }).method === 'PATCH'
+      );
+      expect(anyStatusPatch).toBeUndefined();
+    });
+
+    test('finalizeStream edits the status message with "Done working." when one exists', async () => {
+      const adapter = streamAdapter();
+      // Seed a status message for this conversation (as createStatusMessage would).
+      (
+        adapter as unknown as {
+          statusMessageQueues: Map<string, Array<{ id: number; text: string }>>;
+        }
+      ).statusMessageQueues.set('stream:1:T', [{ id: 900, text: '12:00:00 Starting working...' }]);
+      await adapter.sendMessage('stream:1:T', 'the answer');
+      mockFetch.mockClear();
+
+      await adapter.finalizeStream('stream:1:T');
+
+      // The status message (id 900) is edited to append the closing line.
+      expect(contentOf(patchTo(900))).toContain('Done working.');
+      // No standalone "Done working." POST — the marker was appended to the status message.
+      const standalone = messagePosts().find(p => contentOf(p).includes('Done working.'));
+      expect(standalone).toBeUndefined();
     });
 
     test('safety fallback: a post error mid-stream still delivers the answer at finalize', async () => {

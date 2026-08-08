@@ -35,7 +35,7 @@ Chat adapters support two response-delivery modes, configured per-platform via t
 | Mode | Behavior | When to use |
 |------|----------|-------------|
 | `stream` | AI tokens are sent progressively — the bot edits its own message live as text is generated. | When the platform supports real-time message editing (Telegram, Zulip) and you want an interactive feel. |
-| `batch` | The AI completes the full response before sending; a `Starting thinking…` status message gives immediate feedback while the AI works. | More reliable across platforms; recommended as the default. |
+| `batch` | The AI completes the full response before sending; a `Starting working…` status message gives immediate feedback while the AI works. | More reliable across platforms; recommended as the default. |
 
 **Default modes by platform:**
 
