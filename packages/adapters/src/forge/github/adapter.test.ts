@@ -1528,6 +1528,9 @@ describe('GitHubAdapter', () => {
     }
 
     beforeEach(() => {
+      // Hermetic auth: a leaked GITHUB_ALLOWED_USERS from the caller's shell would
+      // reject these tests' webhook senders before the code under test runs.
+      delete process.env.GITHUB_ALLOWED_USERS;
       mockCloneRepository.mockClear();
       mockCloneRepository.mockResolvedValue({ ok: true, value: undefined });
       mockExecFileAsync.mockClear();
