@@ -674,7 +674,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
 
     // Initialize Zulip adapter (conditional)
     if (process.env.ZULIP_URL && process.env.ZULIP_BOT_EMAIL && process.env.ZULIP_BOT_API_KEY) {
-      const zulipStreamingMode = (process.env.ZULIP_STREAMING_MODE ?? 'batch') as
+      const zulipStreamingMode = (process.env.ZULIP_STREAMING_MODE ?? 'stream') as
         | 'stream'
         | 'batch';
       zulip = new ZulipAdapter(
