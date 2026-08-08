@@ -18,6 +18,8 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 export class WebAdapter implements IWebPlatformAdapter {
+  /** Runtime streaming mode (web streams by default; toggled via /set-chat-mode). */
+  private streamingMode: 'stream' | 'batch' = 'stream';
   /** Per-conversation tool call counter for unique SSE tool IDs */
   private toolCallCounter = new Map<string, number>();
   /**
@@ -233,7 +235,11 @@ export class WebAdapter implements IWebPlatformAdapter {
   }
 
   getStreamingMode(): 'stream' | 'batch' {
-    return 'stream';
+    return this.streamingMode;
+  }
+
+  setStreamingMode(mode: 'stream' | 'batch'): void {
+    this.streamingMode = mode;
   }
 
   getPlatformType(): string {

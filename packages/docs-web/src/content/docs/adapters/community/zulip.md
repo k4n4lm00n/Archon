@@ -52,7 +52,8 @@ All six `ZULIP_*` variables are documented in `.env.example`. Three are **requir
 | `ZULIP_BOT_API_KEY` | **Yes** | The bot's API key (`key` in `zuliprc`). |
 | `ZULIP_BOT_FULL_NAME` | No (but **recommended**) | The bot's display name — required for `@**Bot Name**` mention detection in streams. Without it, the bot still replies to direct messages but cannot detect @mentions. |
 | `ZULIP_ALLOWED_USER_IDS` | No | Comma-separated numeric Zulip user IDs allowed to interact with the bot. **Unset (or empty) → open access**; set → only listed users are answered. A set-but-malformed value (e.g. non-numeric or all-invalid tokens) is a misconfiguration and the bot will **fail to start** — fail-closed, not fail-open. |
-| `ZULIP_STREAMING_MODE` | No | `batch` (default) — the bot edits a "thinking…" status message and posts the full answer once ready. `stream` is accepted but currently has **no runtime effect** in the Zulip adapter (it behaves like `batch`); progressive token streaming is a future addition. See [Configuration → Streaming Modes](/getting-started/configuration/) for the cross-platform overview. |
+| `ZULIP_STREAMING_MODE` | No | `batch` (default) — the bot edits a "thinking…" status message and posts the full answer once ready. `stream` streams the answer progressively as it is generated, then posts a closing "Done thinking." line. Toggle live with `/set-chat-mode <batch\|stream>` (global, resets on restart). See [Configuration → Streaming Modes](/getting-started/configuration/) for the cross-platform overview. |
+| `ZULIP_STREAM_STYLE` | No | Rendering style when `ZULIP_STREAMING_MODE=stream`: `post` (default) posts progressive multi-message updates with a 2-second coalescing window; `edit` edits a single message in place as tokens arrive. Ignored in `batch` mode. |
 
 Example:
 
@@ -63,6 +64,7 @@ ZULIP_BOT_API_KEY=your_api_key_here
 ZULIP_BOT_FULL_NAME=Archon
 # ZULIP_ALLOWED_USER_IDS=12345,67890
 # ZULIP_STREAMING_MODE=batch
+# ZULIP_STREAM_STYLE=post
 ```
 
 ## Usage

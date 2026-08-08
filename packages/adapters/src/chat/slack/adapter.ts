@@ -198,6 +198,10 @@ export class SlackAdapter implements IPlatformAdapter {
     return this.streamingMode;
   }
 
+  setStreamingMode(mode: 'stream' | 'batch'): void {
+    this.streamingMode = mode;
+  }
+
   /**
    * Get platform type
    */

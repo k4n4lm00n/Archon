@@ -1001,3 +1001,269 @@ describe('startup backfill — empty success does not trip abort', () => {
     }
   });
 });
+
+describe('ZulipAdapter stream mode', () => {
+  beforeEach(() => {
+    // This suite asserts exact fetch call sequences, so isolate from prior tests'
+    // calls and any leaked id-returning fetch implementation.
+    mockFetch.mockClear();
+    mockFetch.mockImplementation((_url?: unknown, _init?: unknown) =>
+      Promise.resolve(
+        new Response(JSON.stringify({ result: 'success', queue_id: 'q', last_event_id: 0 }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      )
+    );
+  });
+
+  {
+    // Post/PATCH helpers over the fetch mock, decoding the form-encoded content field.
+    const messagePosts = (): unknown[][] =>
+      mockFetch.mock.calls.filter(
+        c =>
+          String(c[0]).endsWith('/api/v1/messages') &&
+          (c[1] as { method?: string }).method !== 'PATCH'
+      );
+    const patchTo = (id: number): unknown[] | undefined =>
+      mockFetch.mock.calls.find(
+        c =>
+          String(c[0]).includes(`/messages/${id}`) &&
+          (c[1] as { method?: string }).method === 'PATCH'
+      );
+    const contentOf = (call: unknown[] | undefined): string =>
+      new URLSearchParams(String((call?.[1] as { body?: unknown } | undefined)?.body ?? '')).get(
+        'content'
+      ) ?? '';
+
+    const streamAdapter = (): ZulipAdapter => {
+      const adapter = new ZulipAdapter(
+        'https://test.zulipchat.com',
+        'bot@test.com',
+        'key',
+        'stream'
+      );
+      (adapter as unknown as { client: typeof mockZulipClient }).client = mockZulipClient;
+      (adapter as unknown as { replyContexts: Map<string, ZulipReplyContext> }).replyContexts.set(
+        'stream:1:T',
+        { type: 'stream', stream_id: 1, topic: 'T' }
+      );
+      return adapter;
+    };
+
+    type Turn = {
+      style: 'post' | 'edit';
+      buffer: string;
+      flushTimer?: ReturnType<typeof setTimeout>;
+      lastPostAt: number;
+      postedMsgIds: number[];
+      editMsgId?: number;
+      rendered: string;
+      fellBackToBatch: boolean;
+      retracted: boolean;
+      overwriteFirstOnNextSend: boolean;
+    };
+    const turnsOf = (a: ZulipAdapter): Map<string, Turn> =>
+      (a as unknown as { streamTurns: Map<string, Turn> }).streamTurns;
+    const seedTurn = (a: ZulipAdapter, conv: string, over: Partial<Turn>): Turn => {
+      const turn: Turn = {
+        style: 'post',
+        buffer: '',
+        lastPostAt: Date.now(),
+        postedMsgIds: [],
+        rendered: '',
+        fellBackToBatch: false,
+        retracted: false,
+        overwriteFirstOnNextSend: false,
+        ...over,
+      };
+      turnsOf(a).set(conv, turn);
+      return turn;
+    };
+
+    test('setStreamingMode flips getStreamingMode() at runtime', () => {
+      const adapter = new ZulipAdapter('https://test.zulipchat.com', 'bot@test.com', 'key');
+      expect(adapter.getStreamingMode()).toBe('batch');
+      adapter.setStreamingMode('stream');
+      expect(adapter.getStreamingMode()).toBe('stream');
+      adapter.setStreamingMode('batch');
+      expect(adapter.getStreamingMode()).toBe('batch');
+    });
+
+    test('a chunk within the coalescing window is buffered, not posted immediately', async () => {
+      const adapter = streamAdapter();
+      await adapter.sendMessage('stream:1:T', 'Hello');
+      expect(messagePosts().length).toBe(0);
+      // Cancel the armed 2s flush timer so it can't fire during a later test.
+      await adapter.emitRetract('stream:1:T');
+    });
+
+    test('two chunks coalesce into one combined POST at finalizeStream', async () => {
+      const adapter = streamAdapter();
+      await adapter.sendMessage('stream:1:T', 'Hello ');
+      await adapter.sendMessage('stream:1:T', 'world');
+      expect(messagePosts().length).toBe(0);
+
+      await adapter.finalizeStream('stream:1:T');
+
+      const posts = messagePosts();
+      expect(posts.length).toBe(1);
+      expect(contentOf(posts[0])).toBe('Hello world');
+      // Turn state is cleared after finalize.
+      expect(turnsOf(adapter).has('stream:1:T')).toBe(false);
+    });
+
+    test('finalizeStream posts the closing "Done thinking." line and marks read', async () => {
+      process.env.ZULIP_BOT_FULL_NAME = 'TestBot';
+      try {
+        mockFetch.mockImplementation(() =>
+          Promise.resolve(
+            new Response(
+              JSON.stringify({ result: 'success', id: 500, queue_id: 'q', last_event_id: 0 }),
+              { status: 200, headers: { 'content-type': 'application/json' } }
+            )
+          )
+        );
+        const adapter = new ZulipAdapter(
+          'https://test.zulipchat.com',
+          'bot@test.com',
+          'key',
+          'stream'
+        );
+        (adapter as unknown as { client: typeof mockZulipClient }).client = mockZulipClient;
+        adapter.onMessage(() => Promise.resolve());
+
+        // Establish status message (id=500) + pending-read via the normal inbound path.
+        await (
+          adapter as unknown as { handleIncomingMessage: (m: ZulipMessage) => Promise<void> }
+        ).handleIncomingMessage({
+          id: 100,
+          sender_id: 5,
+          sender_email: 'u@test.com',
+          sender_full_name: 'U',
+          content: '@**TestBot** hello',
+          type: 'stream',
+          stream_id: 1,
+          subject: 'topic',
+          display_recipient: 'general',
+        });
+        mockFetch.mockClear();
+
+        await adapter.finalizeStream('stream:1:topic');
+
+        // Closing status line edited into the status message.
+        expect(contentOf(patchTo(500))).toContain('Done thinking.');
+        // Mark-read POST to messages/flags.
+        const markRead = mockFetch.mock.calls.find(c =>
+          String(c[0]).endsWith('/api/v1/messages/flags')
+        );
+        expect(markRead).toBeDefined();
+      } finally {
+        delete process.env.ZULIP_BOT_FULL_NAME;
+      }
+    });
+
+    test('emitRetract blanks later chunk-messages and overwrites the first with the next send', async () => {
+      const adapter = streamAdapter();
+      seedTurn(adapter, 'stream:1:T', { postedMsgIds: [10, 20], rendered: 'streamed text' });
+
+      await adapter.emitRetract('stream:1:T');
+
+      // Chunk-message 2 blanked with a zero-width placeholder.
+      expect(contentOf(patchTo(20))).toBe('\u200b');
+      expect(turnsOf(adapter).get('stream:1:T')?.overwriteFirstOnNextSend).toBe(true);
+
+      // The next send (workflow kickoff) overwrites the first chunk-message in place.
+      await adapter.sendMessage('stream:1:T', 'Kicked off workflow');
+      expect(contentOf(patchTo(10))).toBe('Kicked off workflow');
+      // No brand-new message POST for the kickoff (it was an in-place edit).
+      expect(messagePosts().length).toBe(0);
+    });
+
+    test('emitRetract with nothing posted yet discards the buffer without any PATCH', async () => {
+      const adapter = streamAdapter();
+      seedTurn(adapter, 'stream:1:T', { postedMsgIds: [], buffer: 'unposted' });
+
+      await adapter.emitRetract('stream:1:T');
+
+      const turn = turnsOf(adapter).get('stream:1:T');
+      expect(turn?.retracted).toBe(true);
+      expect(turn?.buffer).toBe('');
+      expect(turn?.overwriteFirstOnNextSend).toBe(false);
+      const anyPatch = mockFetch.mock.calls.find(
+        c => (c[1] as { method?: string }).method === 'PATCH'
+      );
+      expect(anyPatch).toBeUndefined();
+    });
+
+    test('sendStructuredEvent posts a tool indicator as a spoiler block', async () => {
+      const adapter = streamAdapter();
+      await adapter.sendStructuredEvent('stream:1:T', {
+        type: 'tool',
+        toolName: 'Bash',
+        toolInput: { command: 'ls' },
+      });
+      const posts = messagePosts();
+      expect(posts.length).toBe(1);
+      const content = contentOf(posts[0]);
+      expect(content).toContain('spoiler');
+      expect(content).toContain('Bash');
+    });
+
+    test('safety fallback: a post error mid-stream still delivers the answer at finalize', async () => {
+      const adapter = streamAdapter();
+      // Force an immediate flush on the next chunk (window already elapsed), then fail it once.
+      seedTurn(adapter, 'stream:1:T', { lastPostAt: 0 });
+      mockFetch.mockImplementationOnce(() => Promise.reject(new Error('boom')));
+
+      await adapter.sendMessage('stream:1:T', 'part one');
+      expect(turnsOf(adapter).get('stream:1:T')?.fellBackToBatch).toBe(true);
+
+      await adapter.sendMessage('stream:1:T', ' part two');
+      await adapter.finalizeStream('stream:1:T');
+
+      // The full answer is posted once at finalize (never dropped).
+      const delivered = messagePosts().some(p => contentOf(p).includes('part one part two'));
+      expect(delivered).toBe(true);
+    });
+
+    test('edit style edits one message in place instead of posting new chunks', async () => {
+      process.env.ZULIP_STREAM_STYLE = 'edit';
+      try {
+        mockFetch.mockImplementation(() =>
+          Promise.resolve(
+            new Response(
+              JSON.stringify({ result: 'success', id: 700, queue_id: 'q', last_event_id: 0 }),
+              { status: 200, headers: { 'content-type': 'application/json' } }
+            )
+          )
+        );
+        const adapter = new ZulipAdapter(
+          'https://test.zulipchat.com',
+          'bot@test.com',
+          'key',
+          'stream'
+        );
+        (adapter as unknown as { client: typeof mockZulipClient }).client = mockZulipClient;
+        (adapter as unknown as { replyContexts: Map<string, ZulipReplyContext> }).replyContexts.set(
+          'stream:1:T',
+          { type: 'stream', stream_id: 1, topic: 'T' }
+        );
+
+        // First chunk creates the message (id=700).
+        await adapter.sendMessage('stream:1:T', 'Hello ');
+        expect(messagePosts().length).toBe(1);
+
+        // Second chunk within the window does not post a new message.
+        await adapter.sendMessage('stream:1:T', 'world');
+        expect(messagePosts().length).toBe(1);
+
+        // Finalize edits the single message in place with the full rendered answer.
+        await adapter.finalizeStream('stream:1:T');
+        expect(contentOf(patchTo(700))).toBe('Hello world');
+      } finally {
+        delete process.env.ZULIP_STREAM_STYLE;
+      }
+    });
+  }
+});

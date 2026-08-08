@@ -49,6 +49,7 @@ These commands are handled deterministically by the orchestrator — they always
 |---------|-------------|
 | `/status` | Show conversation state |
 | `/reset` | Clear session completely |
+| `/set-chat-mode <batch\|stream>` | Switch reply delivery mode at runtime (global, non-persistent) |
 | `/help` | Show all commands |
 
 ---

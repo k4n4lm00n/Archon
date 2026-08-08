@@ -129,6 +129,14 @@ export interface IPlatformAdapter {
   getStreamingMode(): 'stream' | 'batch';
 
   /**
+   * Set the streaming mode at runtime (global, non-persistent).
+   * Used by the `/set-chat-mode` command to flip the live adapter's delivery
+   * mode without a restart. Always-batch adapters (forge) implement this as a
+   * documented no-op and keep `getStreamingMode()` returning `'batch'`.
+   */
+  setStreamingMode(mode: 'stream' | 'batch'): void;
+
+  /**
    * Get the platform type identifier (e.g., 'telegram', 'github', 'slack')
    */
   getPlatformType(): string;
@@ -152,6 +160,13 @@ export interface IPlatformAdapter {
 
   /** Retract previously streamed text (used when workflow routing intercepts) */
   emitRetract?(conversationId: string): Promise<void>;
+
+  /**
+   * Optional finish-signal for streaming adapters — called once at the end of a
+   * streamed turn to flush buffered output and post a closing status line. Only
+   * implemented by adapters that buffer stream chunks (e.g. Zulip).
+   */
+  finalizeStream?(conversationId: string): Promise<void>;
 
   /**
    * Optional: Append a small footer summarising cost / token usage / stop reason

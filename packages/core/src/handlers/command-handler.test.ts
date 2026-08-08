@@ -526,6 +526,12 @@ describe('CommandHandler', () => {
       expect(result.command).toBe('');
       expect(result.args).toEqual([]);
     });
+
+    test('should parse /set-chat-mode with its mode argument', () => {
+      const result = parseCommand('/set-chat-mode stream');
+      expect(result.command).toBe('set-chat-mode');
+      expect(result.args).toEqual(['stream']);
+    });
   });
 
   describe('handleCommand', () => {

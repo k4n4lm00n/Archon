@@ -1,9 +1,10 @@
 import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
+import type { MessageChunk } from '@archon/providers/types';
 import { createLogger } from '@archon/paths';
 import zulip from 'zulip-js';
 import type { ZulipMessage, ZulipReplyContext } from './types';
 import { parseAllowedUserIds, isZulipUserAuthorized } from './auth';
-import { splitIntoParagraphChunks } from '../../../utils/message-splitting';
+import { splitIntoAtomicChunks } from '../../../utils/message-splitting';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -20,6 +21,12 @@ const BACKFILL_MAX = 50;
 const PROCESSED_IDS_MAX = 2000;
 /** Minimum milliseconds between consecutive status-message edits (debounce guard). */
 const STATUS_MIN_INTERVAL_MS = 500;
+/**
+ * Coalescing window for stream mode. Deltas are buffered and flushed at most once
+ * per window (post style) or the in-place edit is debounced by it (edit style).
+ * Also throttles against Zulip's 429 rate limits.
+ */
+const STREAM_COALESCE_MS = 2000;
 /**
  * Event types the bot's queue subscribes to. `update_message` is required so that a message
  * edited to ADD an @mention (the user forgot it the first time) is picked up — edits do not
@@ -44,11 +51,40 @@ export function formatUtcTime(): string {
   return `${h}:${m}:${s}`;
 }
 
+/**
+ * Per-conversation state for one streamed assistant turn. Created lazily on the
+ * first stream-mode chunk and deleted in finalizeStream (or on emitRetract's
+ * terminal path). Per-turn only — never retained across turns.
+ */
+interface ZulipStreamTurn {
+  style: 'post' | 'edit';
+  /** Deltas not yet posted (post style) / rendered (kept in `rendered`). */
+  buffer: string;
+  flushTimer?: ReturnType<typeof setTimeout>;
+  /** Date.now() of the last post/edit (drives the coalescing window). */
+  lastPostAt: number;
+  /** Chunk-message ids posted this turn (used by emitRetract to blank/overwrite). */
+  postedMsgIds: number[];
+  /** Single message id for edit style (edited in place). */
+  editMsgId?: number;
+  /** Full accumulated answer text (edit style renders this; post-style fallback uses it). */
+  rendered: string;
+  /** Safety latch: a stream API error occurred; remaining content posts once at finalize. */
+  fellBackToBatch: boolean;
+  /** Set by emitRetract; finalize won't re-post buffered text. */
+  retracted: boolean;
+  /** One-shot: the next sendMessage (workflow kickoff) overwrites postedMsgIds[0] in place. */
+  overwriteFirstOnNextSend: boolean;
+}
+
 export class ZulipAdapter implements IPlatformAdapter {
   private readonly serverUrl: string;
   private readonly botEmail: string;
   private readonly apiKey: string;
   private streamingMode: 'stream' | 'batch';
+  private readonly streamStyle: 'post' | 'edit';
+  // conversationId -> in-flight stream-turn state (post/edit coalescing buffers).
+  private streamTurns = new Map<string, ZulipStreamTurn>();
   private allowedUserIds: number[];
   private replyContexts = new Map<string, ZulipReplyContext>();
   private processedMessageIds = new Set<number>();
@@ -75,10 +111,11 @@ export class ZulipAdapter implements IPlatformAdapter {
     this.botEmail = botEmail;
     this.apiKey = apiKey;
     this.streamingMode = mode;
-    // TODO: `mode === 'stream'` is accepted but currently has no runtime effect — every reply
-    // path uses the batch-style "Starting thinking…" / "Done thinking." status edits.
-    // True progressive token streaming would require splitting `sendMessage` and editing the
-    // answer message in place; until then, callers picking `stream` get the same UX as `batch`.
+    // Stream rendering style (only relevant when streamingMode === 'stream'):
+    //   post  (default) — progressive multi-message posting with a coalescing window
+    //   edit            — edit one message in place via updateMessage
+    // Anything other than the literal 'edit' falls back to 'post'.
+    this.streamStyle = process.env.ZULIP_STREAM_STYLE === 'edit' ? 'edit' : 'post';
     this.allowedUserIds = parseAllowedUserIds(process.env.ZULIP_ALLOWED_USER_IDS);
     // bot full name (required for @mention detection — must be set via env)
     this.botFullName = process.env.ZULIP_BOT_FULL_NAME ?? '';
@@ -93,11 +130,16 @@ export class ZulipAdapter implements IPlatformAdapter {
         'zulip.bot_full_name_not_set — set ZULIP_BOT_FULL_NAME; stream @mention detection disabled'
       );
     }
-    getLog().info({ mode }, 'zulip.adapter_initialized');
+    getLog().info({ mode, style: this.streamStyle }, 'zulip.adapter_initialized');
   }
 
   getStreamingMode(): 'stream' | 'batch' {
     return this.streamingMode;
+  }
+
+  setStreamingMode(mode: 'stream' | 'batch'): void {
+    this.streamingMode = mode;
+    getLog().debug({ mode }, 'zulip.streaming_mode_set');
   }
 
   getPlatformType(): string {
@@ -148,6 +190,13 @@ export class ZulipAdapter implements IPlatformAdapter {
 
     const isError = metadata?.isError === true;
 
+    // Stream mode: route normal chunks to the coalescing stream-turn handler. Error
+    // sends bypass streaming — they post immediately (batch body below) and mark read.
+    if (this.streamingMode === 'stream' && !isError) {
+      await this.handleStreamChunk(conversationId, ctx, text);
+      return;
+    }
+
     const statusQueue = this.statusMessageQueues.get(conversationId);
     if (statusQueue && statusQueue.length > 0) {
       const statusEntry = statusQueue.shift();
@@ -194,7 +243,7 @@ export class ZulipAdapter implements IPlatformAdapter {
     // chunks if a later one fails. A throw mid-loop therefore leaves the user with a truncated
     // answer in the topic — the throw bubbles up to the caller's logging, and the inbound message
     // is intentionally NOT marked read (see markOldestPendingRead) so the next boot can retry.
-    const chunks = text.length > MAX_LENGTH ? splitIntoParagraphChunks(text, MAX_LENGTH) : [text];
+    const chunks = text.length > MAX_LENGTH ? splitIntoAtomicChunks(text, MAX_LENGTH) : [text];
     for (const chunk of chunks) {
       await this.postChunk(ctx, chunk);
     }
@@ -217,21 +266,313 @@ export class ZulipAdapter implements IPlatformAdapter {
     if (id !== undefined) await this.markRead(id);
   }
 
-  /** Post a single chunk to the correct Zulip conversation (stream or DM). */
+  /** Post a single chunk to the correct Zulip conversation (stream or DM). Throws on failure. */
   private async postChunk(ctx: ZulipReplyContext, content: string): Promise<void> {
+    await this.postChunkCapture(ctx, content);
+  }
+
+  /**
+   * Post a single chunk and return the created message id (undefined if the response
+   * omits a numeric id). Throws on API failure so callers can drive fallback behavior.
+   */
+  private async postChunkCapture(
+    ctx: ZulipReplyContext,
+    content: string
+  ): Promise<number | undefined> {
+    let response: Record<string, unknown>;
     if (ctx.type === 'stream') {
-      await this.zulipPost('messages', {
+      response = await this.zulipPost('messages', {
         type: 'stream',
         to: String(ctx.stream_id),
         topic: ctx.topic,
         content,
       });
     } else {
-      await this.zulipPost('messages', {
+      response = await this.zulipPost('messages', {
         type: 'private',
         to: JSON.stringify(ctx.user_ids),
         content,
       });
+    }
+    return typeof response.id === 'number' ? response.id : undefined;
+  }
+
+  // ─── Stream mode ──────────────────────────────────────────────────────────
+
+  /** Get or lazily create the stream-turn state for a conversation. */
+  private getOrCreateStreamTurn(conversationId: string): ZulipStreamTurn {
+    let turn = this.streamTurns.get(conversationId);
+    if (!turn) {
+      turn = {
+        style: this.streamStyle,
+        buffer: '',
+        // Start the coalescing window at turn creation so the first delta is buffered
+        // (not posted the instant it arrives) — deltas within the window coalesce.
+        lastPostAt: Date.now(),
+        postedMsgIds: [],
+        rendered: '',
+        fellBackToBatch: false,
+        retracted: false,
+        overwriteFirstOnNextSend: false,
+      };
+      this.streamTurns.set(conversationId, turn);
+    }
+    return turn;
+  }
+
+  /**
+   * Route one streamed assistant chunk. Buffers deltas and posts/edits within a
+   * coalescing window; on a post/edit API error, latches `fellBackToBatch` so the
+   * remaining content is posted once at finalizeStream (never dropped).
+   */
+  private async handleStreamChunk(
+    conversationId: string,
+    ctx: ZulipReplyContext,
+    text: string
+  ): Promise<void> {
+    const turn = this.getOrCreateStreamTurn(conversationId);
+
+    // One-shot after emitRetract: the next send is the workflow kickoff note — overwrite
+    // the first posted chunk-message in place instead of posting a new message.
+    if (turn.overwriteFirstOnNextSend) {
+      turn.overwriteFirstOnNextSend = false;
+      const firstId = turn.postedMsgIds[0];
+      if (firstId !== undefined) {
+        await this.updateMessage(firstId, text);
+      } else {
+        try {
+          const id = await this.postChunkCapture(ctx, text);
+          if (id !== undefined) turn.postedMsgIds.push(id);
+        } catch (error) {
+          getLog().warn({ err: error, conversationId }, 'zulip.stream_post_failed');
+        }
+      }
+      return;
+    }
+
+    turn.buffer += text;
+    turn.rendered += text;
+
+    // Already fell back to batch: just accumulate; finalizeStream posts the remainder.
+    if (turn.fellBackToBatch) return;
+
+    if (turn.style === 'edit') {
+      await this.renderEditStyle(conversationId, ctx, turn);
+      return;
+    }
+
+    // post style: flush if the coalescing window has elapsed, else arm a timer.
+    const now = Date.now();
+    if (now - turn.lastPostAt >= STREAM_COALESCE_MS) {
+      await this.flushStreamBuffer(conversationId, ctx, turn);
+    } else if (!turn.flushTimer) {
+      const delay = STREAM_COALESCE_MS - (now - turn.lastPostAt);
+      turn.flushTimer = setTimeout(() => {
+        turn.flushTimer = undefined;
+        void this.flushStreamBuffer(conversationId, ctx, turn).catch(error => {
+          getLog().warn({ err: error, conversationId }, 'zulip.stream_flush_failed');
+        });
+      }, delay);
+    }
+  }
+
+  /** Post the accumulated buffer (post style), capturing message ids. Latches fallback on error. */
+  private async flushStreamBuffer(
+    conversationId: string,
+    ctx: ZulipReplyContext,
+    turn: ZulipStreamTurn
+  ): Promise<void> {
+    if (turn.flushTimer) {
+      clearTimeout(turn.flushTimer);
+      turn.flushTimer = undefined;
+    }
+    const toPost = turn.buffer;
+    if (!toPost) return;
+    turn.buffer = '';
+    turn.lastPostAt = Date.now();
+    try {
+      const chunks =
+        toPost.length > MAX_LENGTH ? splitIntoAtomicChunks(toPost, MAX_LENGTH) : [toPost];
+      for (const chunk of chunks) {
+        const id = await this.postChunkCapture(ctx, chunk);
+        if (id !== undefined) turn.postedMsgIds.push(id);
+      }
+    } catch (error) {
+      // Do NOT swallow the answer: buffer the un-posted content again and let
+      // finalizeStream post it once as a batched message.
+      getLog().warn({ err: error, conversationId }, 'zulip.stream_post_failed');
+      turn.fellBackToBatch = true;
+      turn.buffer = toPost + turn.buffer;
+    }
+  }
+
+  /** Edit one message in place (edit style), debounced by the coalescing window. */
+  private async renderEditStyle(
+    conversationId: string,
+    ctx: ZulipReplyContext,
+    turn: ZulipStreamTurn
+  ): Promise<void> {
+    const now = Date.now();
+    if (turn.editMsgId === undefined) {
+      // First chunk: create the message we will edit in place from here on.
+      try {
+        const id = await this.postChunkCapture(ctx, turn.rendered);
+        if (id !== undefined) {
+          turn.editMsgId = id;
+          turn.postedMsgIds.push(id);
+          turn.lastPostAt = now;
+        }
+      } catch (error) {
+        getLog().warn({ err: error, conversationId }, 'zulip.stream_post_failed');
+        turn.fellBackToBatch = true;
+      }
+      return;
+    }
+    const editId = turn.editMsgId;
+    if (now - turn.lastPostAt >= STREAM_COALESCE_MS) {
+      turn.lastPostAt = now;
+      await this.updateMessage(editId, turn.rendered);
+    } else if (!turn.flushTimer) {
+      const delay = STREAM_COALESCE_MS - (now - turn.lastPostAt);
+      turn.flushTimer = setTimeout(() => {
+        turn.flushTimer = undefined;
+        turn.lastPostAt = Date.now();
+        void this.updateMessage(editId, turn.rendered);
+      }, delay);
+    }
+  }
+
+  /** Post final content as one batched message (atomic-split), capturing ids. Best-effort. */
+  private async postFinalBatched(
+    conversationId: string,
+    ctx: ZulipReplyContext,
+    turn: ZulipStreamTurn,
+    text: string
+  ): Promise<void> {
+    try {
+      const chunks = text.length > MAX_LENGTH ? splitIntoAtomicChunks(text, MAX_LENGTH) : [text];
+      for (const chunk of chunks) {
+        const id = await this.postChunkCapture(ctx, chunk);
+        if (id !== undefined) turn.postedMsgIds.push(id);
+      }
+    } catch (error) {
+      getLog().error({ err: error, conversationId }, 'zulip.stream_final_post_failed');
+    }
+  }
+
+  /**
+   * Finish-signal for a streamed turn (IPlatformAdapter.finalizeStream). Flushes any
+   * remaining buffered output, posts the closing "Done thinking." status line, marks the
+   * inbound message read (moved here for stream mode), and clears the turn state.
+   * Best-effort: logs and never throws.
+   */
+  async finalizeStream(conversationId: string): Promise<void> {
+    const turn = this.streamTurns.get(conversationId);
+    try {
+      if (turn) {
+        if (turn.flushTimer) {
+          clearTimeout(turn.flushTimer);
+          turn.flushTimer = undefined;
+        }
+        const ctx = this.replyContexts.get(conversationId);
+        // emitRetract discards buffered text and drives its own overwrite; skip the flush.
+        if (!turn.retracted && ctx) {
+          if (turn.style === 'edit') {
+            if (turn.fellBackToBatch) {
+              if (turn.rendered)
+                await this.postFinalBatched(conversationId, ctx, turn, turn.rendered);
+            } else if (turn.editMsgId !== undefined) {
+              await this.updateMessage(turn.editMsgId, turn.rendered);
+            } else if (turn.rendered) {
+              await this.postFinalBatched(conversationId, ctx, turn, turn.rendered);
+            }
+          } else if (turn.buffer) {
+            // post style: post whatever hasn't been posted (fell back or last window).
+            await this.postFinalBatched(conversationId, ctx, turn, turn.buffer);
+            turn.buffer = '';
+          }
+        }
+      }
+      await this.postClosingStatus(conversationId);
+      await this.markOldestPendingRead(conversationId);
+    } catch (error) {
+      getLog().warn({ err: error, conversationId }, 'zulip.finalize_stream_failed');
+    } finally {
+      this.streamTurns.delete(conversationId);
+    }
+  }
+
+  /**
+   * Append the closing "Done thinking." line to the conversation's status message.
+   * Consumes the same FIFO entry the batch path would; no-op if no status message exists.
+   */
+  private async postClosingStatus(conversationId: string): Promise<void> {
+    const statusQueue = this.statusMessageQueues.get(conversationId);
+    if (!statusQueue || statusQueue.length === 0) return;
+    const statusEntry = statusQueue.shift();
+    if (statusEntry === undefined) {
+      getLog().error({ conversationId }, 'zulip.status_queue_inconsistency');
+      return;
+    }
+    if (statusQueue.length === 0) {
+      this.statusMessageQueues.delete(conversationId);
+      this.statusLastEdit.delete(conversationId);
+    }
+    const newText = `${statusEntry.text}\n${formatUtcTime()} Done thinking.`;
+    await this.updateMessage(statusEntry.id, newText);
+  }
+
+  /**
+   * Send a structured tool/thinking event as a collapsible Zulip spoiler block
+   * (IPlatformAdapter.sendStructuredEvent). Best-effort — logs and swallows failures.
+   */
+  async sendStructuredEvent(conversationId: string, event: MessageChunk): Promise<void> {
+    try {
+      const ctx = this.replyContexts.get(conversationId);
+      if (!ctx) return;
+      let block: string | undefined;
+      if (event.type === 'tool') {
+        const input = event.toolInput ? JSON.stringify(event.toolInput, null, 2) : '';
+        block = `\`\`\`spoiler 🔧 ${event.toolName}\n${input}\n\`\`\``;
+      } else if (event.type === 'thinking') {
+        block = `\`\`\`spoiler 💭 thinking\n${event.content}\n\`\`\``;
+      }
+      if (!block) return;
+      await this.postChunk(ctx, block);
+    } catch (error) {
+      getLog().warn({ err: error, conversationId }, 'zulip.structured_event_failed');
+    }
+  }
+
+  /**
+   * Retract streamed text when workflow routing intercepts (IPlatformAdapter.emitRetract).
+   * Discards the buffer and arms the next send (the workflow kickoff note) to overwrite the
+   * first posted chunk-message; blanks any other posted chunk-messages. Best-effort.
+   */
+  async emitRetract(conversationId: string): Promise<void> {
+    const turn = this.streamTurns.get(conversationId);
+    if (!turn) return;
+    try {
+      turn.retracted = true;
+      if (turn.flushTimer) {
+        clearTimeout(turn.flushTimer);
+        turn.flushTimer = undefined;
+      }
+      turn.buffer = '';
+      if (turn.postedMsgIds.length === 0) {
+        // Nothing posted yet (trailing command still buffered) — the next send posts fresh.
+        getLog().debug({ conversationId }, 'zulip.emit_retract');
+        return;
+      }
+      // Blank chunk-messages 2..N (zero-width space); arm the first for in-place overwrite.
+      for (let i = 1; i < turn.postedMsgIds.length; i++) {
+        const id = turn.postedMsgIds[i];
+        if (id !== undefined) await this.updateMessage(id, '\u200b');
+      }
+      turn.overwriteFirstOnNextSend = true;
+      getLog().debug({ conversationId }, 'zulip.emit_retract');
+    } catch (error) {
+      getLog().warn({ err: error, conversationId }, 'zulip.emit_retract_failed');
     }
   }
 

@@ -1693,6 +1693,7 @@ export async function handleMessage(
         'update-project',
         'remove-project',
         'setproject',
+        'set-chat-mode',
         'commands',
         'init',
         'worktree',
@@ -1727,6 +1728,22 @@ export async function handleMessage(
           // and needs the prior cwd/isolation state for the detach note.
           const result = await handleSetProject(message, conversation);
           await platform.sendMessage(conversationId, result);
+          return;
+        }
+
+        if (command === 'set-chat-mode') {
+          getLog().debug({ command, conversationId }, 'deterministic_command');
+          const { args } = commandHandler.parseCommand(message);
+          const parsed = parseSetChatMode(args);
+          if ('error' in parsed) {
+            await platform.sendMessage(conversationId, parsed.error);
+            return;
+          }
+          platform.setStreamingMode(parsed.mode);
+          await platform.sendMessage(
+            conversationId,
+            `Chat mode set to \`${parsed.mode}\` (applies globally, resets on restart).`
+          );
           return;
         }
 
@@ -2399,6 +2416,19 @@ export async function handleMessage(
   }
 }
 
+/**
+ * Validate the argument to `/set-chat-mode`. Pure helper so it is unit-testable
+ * without the orchestrator. Exact-match only (`batch`/`stream`); anything else
+ * — including wrong case or a missing arg — returns a valid-values error.
+ */
+export function parseSetChatMode(args: string[]): { mode: 'stream' | 'batch' } | { error: string } {
+  const value = args[0];
+  if (value === 'batch' || value === 'stream') return { mode: value };
+  return {
+    error: 'Usage: `/set-chat-mode <batch|stream>` — valid values are `batch` or `stream`.',
+  };
+}
+
 // ─── Streaming Mode ─────────────────────────────────────────────────────────
 
 /**
@@ -2428,205 +2458,219 @@ async function handleStreamMode(
   let commandFullyParsed = false;
   let lastResult: { cost?: number; tokens?: TokenUsage; stopReason?: string } | undefined;
 
-  for await (const msg of aiClient.sendQuery(
-    fullPrompt,
-    cwd,
-    session.assistant_session_id ?? undefined,
-    requestOptions
-  )) {
-    if (msg.type === 'assistant' && msg.content) {
-      // Accumulate only while the command is not yet fully captured; post-command
-      // trailing chunks would corrupt the project-name token if joined without a
-      // whitespace boundary, causing the parse regex to overshoot.
-      if (!commandFullyParsed) {
-        allMessages.push(msg.content);
-      }
-      if (!commandDetected) {
-        // Check for orchestrator commands BEFORE streaming to frontend.
-        // If detected, suppress this chunk and all future chunks — the full
-        // response will be parsed post-loop and the command dispatched there.
-        const accumulated = allMessages.join('');
-        const normalizedAccumulated = normalizeCommandText(accumulated);
-        if (
-          INVOKE_WORKFLOW_PREFIX_RE.test(normalizedAccumulated) ||
-          REGISTER_PROJECT_PREFIX_RE.test(normalizedAccumulated)
-        ) {
-          commandDetected = true;
-          // If the complete command pattern is already present, stop accumulating —
-          // no more chunks needed. This prevents trailing chunks from corrupting
-          // the project-name token when the command was fully emitted in one chunk.
+  // Wrap the streaming body so a streaming adapter's finish-signal fires exactly
+  // once across every exit point (normal completion, workflow-invocation return,
+  // project-registration return, empty-response return, and error result return).
+  // No catch here — the finally must not swallow body errors; the outer
+  // handleMessage try/catch reports them. finalizeStream itself is best-effort.
+  try {
+    for await (const msg of aiClient.sendQuery(
+      fullPrompt,
+      cwd,
+      session.assistant_session_id ?? undefined,
+      requestOptions
+    )) {
+      if (msg.type === 'assistant' && msg.content) {
+        // Accumulate only while the command is not yet fully captured; post-command
+        // trailing chunks would corrupt the project-name token if joined without a
+        // whitespace boundary, causing the parse regex to overshoot.
+        if (!commandFullyParsed) {
+          allMessages.push(msg.content);
+        }
+        if (!commandDetected) {
+          // Check for orchestrator commands BEFORE streaming to frontend.
+          // If detected, suppress this chunk and all future chunks — the full
+          // response will be parsed post-loop and the command dispatched there.
+          const accumulated = allMessages.join('');
+          const normalizedAccumulated = normalizeCommandText(accumulated);
+          if (
+            INVOKE_WORKFLOW_PREFIX_RE.test(normalizedAccumulated) ||
+            REGISTER_PROJECT_PREFIX_RE.test(normalizedAccumulated)
+          ) {
+            commandDetected = true;
+            // If the complete command pattern is already present, stop accumulating —
+            // no more chunks needed. This prevents trailing chunks from corrupting
+            // the project-name token when the command was fully emitted in one chunk.
+            if (isCommandFullyParsed(accumulated)) {
+              commandFullyParsed = true;
+            }
+          } else {
+            await platform.sendMessage(conversationId, msg.content);
+          }
+        } else if (!commandFullyParsed) {
+          // Post-prefix: keep accumulating until the full command pattern is present.
+          const accumulated = allMessages.join('');
           if (isCommandFullyParsed(accumulated)) {
             commandFullyParsed = true;
           }
-        } else {
-          await platform.sendMessage(conversationId, msg.content);
         }
-      } else if (!commandFullyParsed) {
-        // Post-prefix: keep accumulating until the full command pattern is present.
-        const accumulated = allMessages.join('');
-        if (isCommandFullyParsed(accumulated)) {
-          commandFullyParsed = true;
+      } else if (msg.type === 'tool' && msg.toolName) {
+        if (!commandDetected) {
+          const toolMessage = formatToolCall(msg.toolName, msg.toolInput);
+          await platform.sendMessage(conversationId, toolMessage, {
+            category: 'tool_call_formatted',
+          });
+          if (platform.sendStructuredEvent) {
+            await platform.sendStructuredEvent(conversationId, msg);
+          }
         }
-      }
-    } else if (msg.type === 'tool' && msg.toolName) {
-      if (!commandDetected) {
-        const toolMessage = formatToolCall(msg.toolName, msg.toolInput);
-        await platform.sendMessage(conversationId, toolMessage, {
-          category: 'tool_call_formatted',
-        });
-        if (platform.sendStructuredEvent) {
+      } else if (msg.type === 'tool_result' && msg.toolName) {
+        if (!commandDetected && platform.sendStructuredEvent) {
           await platform.sendStructuredEvent(conversationId, msg);
         }
-      }
-    } else if (msg.type === 'tool_result' && msg.toolName) {
-      if (!commandDetected && platform.sendStructuredEvent) {
-        await platform.sendStructuredEvent(conversationId, msg);
-      }
-    } else if (msg.type === 'result') {
-      if (msg.isError && msg.errorSubtype === 'error_during_execution') {
-        getLog().warn(
-          {
-            conversationId,
-            errorSubtype: msg.errorSubtype,
-            staleSessionId: msg.sessionId,
-            errors: msg.errors,
-            stopReason: msg.stopReason,
-          },
-          'clearing_stale_session_id'
-        );
-        await tryPersistSessionId(session.id, null);
-        newSessionId = undefined;
-      } else if (msg.sessionId) {
-        newSessionId = msg.sessionId;
-      }
-      // Defense-in-depth: errorSubtype === 'success' is the Claude SDK's marker
-      // for a clean stop_sequence termination (the SDK sets is_error: true
-      // alongside subtype: 'success' to encode "non-default termination, not a
-      // failure"). The Claude provider already filters this; the guard here
-      // defends against a third-party IAgentProvider that forwards the SDK
-      // pair raw — without it, direct chat would surface a spurious error to
-      // the user and drop the actual conversation output.
-      if (msg.isError && msg.errorSubtype !== 'success') {
-        getLog().warn(
-          {
-            conversationId,
-            errorSubtype: msg.errorSubtype,
-            errors: msg.errors,
-            stopReason: msg.stopReason,
-          },
-          'ai_result_error'
-        );
-        // Carry the SDK error detail (not just the subtype code) into the
-        // formatter so it can classify actionable cases like "Not logged in"
-        // rather than emitting a generic message (#1983).
-        const errorDetail = [msg.errorSubtype, ...(msg.errors ?? [])].filter(Boolean).join(': ');
-        const syntheticError = new Error(errorDetail || 'AI result error');
-        await platform.sendMessage(conversationId, classifyAndFormatError(syntheticError));
-        if (newSessionId) {
-          await tryPersistSessionId(session.id, newSessionId);
+      } else if (msg.type === 'result') {
+        if (msg.isError && msg.errorSubtype === 'error_during_execution') {
+          getLog().warn(
+            {
+              conversationId,
+              errorSubtype: msg.errorSubtype,
+              staleSessionId: msg.sessionId,
+              errors: msg.errors,
+              stopReason: msg.stopReason,
+            },
+            'clearing_stale_session_id'
+          );
+          await tryPersistSessionId(session.id, null);
+          newSessionId = undefined;
+        } else if (msg.sessionId) {
+          newSessionId = msg.sessionId;
         }
-        // Anonymous telemetry: AI returned an error result for this chat turn.
-        captureChatTurn({
-          platform: platform.getPlatformType(),
-          provider: aiClient.getType(),
-          model: requestOptions?.model,
-          durationMs: Date.now() - turnStartedAt,
-          outcome: 'failed',
-        });
-        return;
+        // Defense-in-depth: errorSubtype === 'success' is the Claude SDK's marker
+        // for a clean stop_sequence termination (the SDK sets is_error: true
+        // alongside subtype: 'success' to encode "non-default termination, not a
+        // failure"). The Claude provider already filters this; the guard here
+        // defends against a third-party IAgentProvider that forwards the SDK
+        // pair raw — without it, direct chat would surface a spurious error to
+        // the user and drop the actual conversation output.
+        if (msg.isError && msg.errorSubtype !== 'success') {
+          getLog().warn(
+            {
+              conversationId,
+              errorSubtype: msg.errorSubtype,
+              errors: msg.errors,
+              stopReason: msg.stopReason,
+            },
+            'ai_result_error'
+          );
+          // Carry the SDK error detail (not just the subtype code) into the
+          // formatter so it can classify actionable cases like "Not logged in"
+          // rather than emitting a generic message (#1983).
+          const errorDetail = [msg.errorSubtype, ...(msg.errors ?? [])].filter(Boolean).join(': ');
+          const syntheticError = new Error(errorDetail || 'AI result error');
+          await platform.sendMessage(conversationId, classifyAndFormatError(syntheticError));
+          if (newSessionId) {
+            await tryPersistSessionId(session.id, newSessionId);
+          }
+          // Anonymous telemetry: AI returned an error result for this chat turn.
+          captureChatTurn({
+            platform: platform.getPlatformType(),
+            provider: aiClient.getType(),
+            model: requestOptions?.model,
+            durationMs: Date.now() - turnStartedAt,
+            outcome: 'failed',
+          });
+          return;
+        }
+        if (!commandDetected && platform.sendStructuredEvent) {
+          await platform.sendStructuredEvent(conversationId, msg);
+        }
+        lastResult = {
+          cost: msg.cost,
+          tokens: msg.tokens,
+          stopReason: msg.stopReason,
+        };
       }
-      if (!commandDetected && platform.sendStructuredEvent) {
-        await platform.sendStructuredEvent(conversationId, msg);
-      }
-      lastResult = {
-        cost: msg.cost,
-        tokens: msg.tokens,
-        stopReason: msg.stopReason,
-      };
     }
-  }
 
-  if (newSessionId) {
-    await tryPersistSessionId(session.id, newSessionId);
-  }
-
-  if (allMessages.length === 0) {
-    // Intentionally NOT counted in chat_turn_handled — an empty response is
-    // neither a completed nor a failed turn worth measuring.
-    getLog().debug({ conversationId }, 'no_ai_response');
-    return;
-  }
-
-  const fullResponse = allMessages.join('');
-  const commands = parseOrchestratorCommands(
-    fullResponse,
-    codebases,
-    workflows.map(ws => ws.workflow)
-  );
-
-  if (commands.workflowInvocation) {
-    // Retract streamed text — workflow dispatch replaces it
-    if (platform.emitRetract) {
-      await platform.emitRetract(conversationId);
+    if (newSessionId) {
+      await tryPersistSessionId(session.id, newSessionId);
     }
-    await handleWorkflowInvocationResult(
-      platform,
-      conversationId,
-      conversation,
-      codebases,
-      workflows,
-      commands.workflowInvocation,
-      originalMessage,
-      isolationHints,
-      issueContext,
-      userId
-    );
-    return;
-  }
 
-  if (commands.projectRegistration) {
-    if (platform.emitRetract) {
-      await platform.emitRetract(conversationId);
+    if (allMessages.length === 0) {
+      // Intentionally NOT counted in chat_turn_handled — an empty response is
+      // neither a completed nor a failed turn worth measuring.
+      getLog().debug({ conversationId }, 'no_ai_response');
+      return;
     }
-    await handleProjectRegistrationResult(
-      platform,
-      conversationId,
+
+    const fullResponse = allMessages.join('');
+    const commands = parseOrchestratorCommands(
       fullResponse,
-      commands.projectRegistration
+      codebases,
+      workflows.map(ws => ws.workflow)
     );
-    return;
-  }
 
-  // Text was already streamed — nothing more to send.
-  // Persist the assistant reply for non-web platforms so it appears in the
-  // Web UI conversation history. The web adapter persists through its
-  // MessagePersistence buffer; skip it here to avoid double-write (#1182).
-  if (!isWebAdapter(platform) && fullResponse) {
-    messageDb.addMessage(conversation.id, 'assistant', fullResponse).catch((e: unknown) => {
-      const err = e instanceof Error ? e : new Error(String(e));
-      getLog().warn(
-        { err, errorType: err.constructor.name, conversationId },
-        'orchestrator.assistant_message_persist_failed'
+    if (commands.workflowInvocation) {
+      // Retract streamed text — workflow dispatch replaces it
+      if (platform.emitRetract) {
+        await platform.emitRetract(conversationId);
+      }
+      await handleWorkflowInvocationResult(
+        platform,
+        conversationId,
+        conversation,
+        codebases,
+        workflows,
+        commands.workflowInvocation,
+        originalMessage,
+        isolationHints,
+        issueContext,
+        userId
       );
+      return;
+    }
+
+    if (commands.projectRegistration) {
+      if (platform.emitRetract) {
+        await platform.emitRetract(conversationId);
+      }
+      await handleProjectRegistrationResult(
+        platform,
+        conversationId,
+        fullResponse,
+        commands.projectRegistration
+      );
+      return;
+    }
+
+    // Text was already streamed — nothing more to send.
+    // Persist the assistant reply for non-web platforms so it appears in the
+    // Web UI conversation history. The web adapter persists through its
+    // MessagePersistence buffer; skip it here to avoid double-write (#1182).
+    if (!isWebAdapter(platform) && fullResponse) {
+      messageDb.addMessage(conversation.id, 'assistant', fullResponse).catch((e: unknown) => {
+        const err = e instanceof Error ? e : new Error(String(e));
+        getLog().warn(
+          { err, errorType: err.constructor.name, conversationId },
+          'orchestrator.assistant_message_persist_failed'
+        );
+      });
+    }
+    await maybeSendResultFooter(platform, conversationId, lastResult);
+    // Anonymous telemetry: one completed direct-chat turn. The workflow-invocation
+    // and project-registration paths return above without reaching this — those
+    // are covered by workflow_invoked / codebase_registered instead. Platform +
+    // provider only, never message content.
+    captureChatTurn({
+      platform: platform.getPlatformType(),
+      provider: aiClient.getType(),
+      model: requestOptions?.model,
+      // durationMs deliberately measures from mode-handler entry — it includes
+      // pre-AI setup, i.e. "time the user waited", not pure model latency.
+      durationMs: Date.now() - turnStartedAt,
+      costUsd: lastResult?.cost,
+      tokensIn: lastResult?.tokens?.input,
+      tokensOut: lastResult?.tokens?.output,
+      outcome: 'completed',
     });
+  } finally {
+    // Finish-signal for streaming adapters that buffer chunks (e.g. Zulip):
+    // flush any buffered output and post the closing status line. Guarded —
+    // most adapters don't implement it. Best-effort on the adapter side.
+    if (platform.finalizeStream) {
+      await platform.finalizeStream(conversationId);
+    }
   }
-  await maybeSendResultFooter(platform, conversationId, lastResult);
-  // Anonymous telemetry: one completed direct-chat turn. The workflow-invocation
-  // and project-registration paths return above without reaching this — those
-  // are covered by workflow_invoked / codebase_registered instead. Platform +
-  // provider only, never message content.
-  captureChatTurn({
-    platform: platform.getPlatformType(),
-    provider: aiClient.getType(),
-    model: requestOptions?.model,
-    // durationMs deliberately measures from mode-handler entry — it includes
-    // pre-AI setup, i.e. "time the user waited", not pure model latency.
-    durationMs: Date.now() - turnStartedAt,
-    costUsd: lastResult?.cost,
-    tokensIn: lastResult?.tokens?.input,
-    tokensOut: lastResult?.tokens?.output,
-    outcome: 'completed',
-  });
 }
 
 // ─── Batch Mode ─────────────────────────────────────────────────────────────

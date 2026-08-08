@@ -48,6 +48,22 @@ Chat adapters support two response-delivery modes, configured per-platform via t
 
 Override per platform via the matching env var (e.g. `ZULIP_STREAMING_MODE=stream`, `TELEGRAM_STREAMING_MODE=batch`).
 
+### Runtime toggle
+
+Use the `/set-chat-mode <batch|stream>` command in any chat to flip the live adapter's
+mode without a restart. The change is **global** (it applies to every conversation the
+adapter serves) and **non-persistent** — on restart the adapter reverts to its
+`*_STREAMING_MODE` env default.
+
+### Zulip stream rendering style
+
+When Zulip runs in `stream` mode, `ZULIP_STREAM_STYLE` selects how progressive output is rendered:
+
+| Style | Behavior |
+|-------|----------|
+| `post` (default) | Progressive multi-message posting with a 2-second coalescing window. |
+| `edit` | A single message is edited in place as tokens arrive. |
+
 ## Project Configuration
 
 Create `.archon/config.yaml` in your repository:

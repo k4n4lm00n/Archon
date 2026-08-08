@@ -407,6 +407,12 @@ export class GitHubAdapter implements IPlatformAdapter {
     return 'batch';
   }
 
+  // Forge adapters are always batch; streaming mode is not user-toggleable here.
+  // Deliberately does NOT store the arg so getStreamingMode() keeps returning 'batch'.
+  setStreamingMode(_mode: 'stream' | 'batch'): void {
+    getLog().debug('github.set_streaming_mode_noop');
+  }
+
   /**
    * Get platform type
    */

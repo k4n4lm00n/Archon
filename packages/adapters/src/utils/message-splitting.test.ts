@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { splitIntoParagraphChunks } from './message-splitting';
+import { splitIntoParagraphChunks, splitIntoAtomicChunks } from './message-splitting';
 
 describe('splitIntoParagraphChunks', () => {
   test('empty string returns empty array', () => {
@@ -60,5 +60,55 @@ describe('splitIntoParagraphChunks', () => {
     // Lines A+B+C group together (18 chars with newlines), D gets its own chunk
     const result = splitIntoParagraphChunks(msg, 20);
     expect(result).toEqual(['Short paragraph.', 'Line A\nLine B\nLine C', 'Line D']);
+  });
+});
+
+describe('splitIntoAtomicChunks', () => {
+  test('empty string returns empty array', () => {
+    expect(splitIntoAtomicChunks('', 100)).toEqual([]);
+  });
+
+  test('prose plus one small code block fits in a single chunk', () => {
+    const msg = 'Here is code:\n```js\nconst x = 1;\n```';
+    expect(splitIntoAtomicChunks(msg, 100)).toEqual([msg]);
+  });
+
+  test('a code block that would straddle a boundary stays whole', () => {
+    const code = '```\nBB\n```'; // length 10
+    const msg = `AAAA\n${code}`;
+    // maxLength 10: prose (4) + code (10) exceed it, so the code block moves to its own chunk.
+    const result = splitIntoAtomicChunks(msg, 10);
+    expect(result).toEqual(['AAAA', code]);
+    // Boundary never fell inside the fence.
+    expect(result[1]?.startsWith('```')).toBe(true);
+    expect(result[1]?.endsWith('```')).toBe(true);
+  });
+
+  test('a single code block larger than maxLength is emitted intact as one chunk', () => {
+    const code = '```\n' + 'X'.repeat(50) + '\n```';
+    const result = splitIntoAtomicChunks(code, 20);
+    expect(result.length).toBe(1);
+    expect(result[0]).toBe(code);
+    expect(result[0]?.startsWith('```')).toBe(true);
+    expect(result[0]?.endsWith('```')).toBe(true);
+  });
+
+  test('two code blocks separated by prose split at the prose boundary, never mid-fence', () => {
+    const code1 = '```\naaa\n```'; // length 11
+    const code2 = '```\nbbb\n```'; // length 11
+    const msg = `${code1}\nmiddle\n${code2}`;
+    const result = splitIntoAtomicChunks(msg, 12);
+    expect(result).toEqual([code1, 'middle', code2]);
+    // Both code chunks retain their full opening and closing fences.
+    for (const chunk of [result[0], result[2]]) {
+      expect(chunk?.startsWith('```')).toBe(true);
+      expect(chunk?.endsWith('```')).toBe(true);
+    }
+  });
+
+  test('an unterminated fence runs to EOF as one atomic chunk', () => {
+    const msg = '```\nno close here';
+    const result = splitIntoAtomicChunks(msg, 100);
+    expect(result).toEqual([msg]);
   });
 });

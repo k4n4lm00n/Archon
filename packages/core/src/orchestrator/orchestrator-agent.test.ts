@@ -408,6 +408,7 @@ mock.module('../db/user-ai-prefs-store', () => ({
 import {
   parseOrchestratorCommands,
   handleMessage,
+  parseSetChatMode,
   resolveChatModelRequest,
   resolveTitleRequest,
   continueResolvedGateRun,
@@ -5532,5 +5533,37 @@ describe('continueResolvedGateRun — chat gate continuation source (#2646)', ()
       c => (c as unknown[])[1] as string
     );
     expect(messages.some(m => m.includes('digest mismatch'))).toBe(true);
+  });
+});
+
+describe('parseSetChatMode', () => {
+  test('accepts stream', () => {
+    expect(parseSetChatMode(['stream'])).toEqual({ mode: 'stream' });
+  });
+
+  test('accepts batch', () => {
+    expect(parseSetChatMode(['batch'])).toEqual({ mode: 'batch' });
+  });
+
+  test('rejects an unknown value with a valid-values error', () => {
+    const result = parseSetChatMode(['bogus']);
+    expect('error' in result).toBe(true);
+    if ('error' in result) {
+      expect(result.error).toContain('batch');
+      expect(result.error).toContain('stream');
+    }
+  });
+
+  test('rejects a missing argument with a valid-values error', () => {
+    const result = parseSetChatMode([]);
+    expect('error' in result).toBe(true);
+    if ('error' in result) {
+      expect(result.error).toContain('batch');
+      expect(result.error).toContain('stream');
+    }
+  });
+
+  test('is case-sensitive: STREAM is rejected', () => {
+    expect('error' in parseSetChatMode(['STREAM'])).toBe(true);
   });
 });
