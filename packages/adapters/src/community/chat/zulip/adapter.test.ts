@@ -1154,8 +1154,12 @@ describe('ZulipAdapter stream mode', () => {
 
         await adapter.finalizeStream('stream:1:topic');
 
-        // Closing status line edited into the status message.
-        expect(contentOf(patchTo(500))).toContain('Done working.');
+        // Closing marker is a STANDALONE bottom POST (not an edit of the top status message).
+        const marker = messagePosts().find(p => contentOf(p).includes('Done working.'));
+        expect(marker).toBeDefined();
+        // The status message (id 500) must NOT be patched with a closing line — it is left
+        // as the top "Starting working..." start-marker (its FIFO entry is consumed silently).
+        expect(patchTo(500)).toBeUndefined();
         // Mark-read POST to messages/flags.
         const markRead = mockFetch.mock.calls.find(c =>
           String(c[0]).endsWith('/api/v1/messages/flags')
@@ -1255,24 +1259,28 @@ describe('ZulipAdapter stream mode', () => {
       expect(anyStatusPatch).toBeUndefined();
     });
 
-    test('finalizeStream edits the status message with "Done working." when one exists', async () => {
+    test('finalizeStream posts standalone "Done working." at the bottom (not editing the status message) when one exists', async () => {
       const adapter = streamAdapter();
       // Seed a status message for this conversation (as createStatusMessage would).
-      (
+      const queues = (
         adapter as unknown as {
           statusMessageQueues: Map<string, Array<{ id: number; text: string }>>;
         }
-      ).statusMessageQueues.set('stream:1:T', [{ id: 900, text: '12:00:00 Starting working...' }]);
+      ).statusMessageQueues;
+      queues.set('stream:1:T', [{ id: 900, text: '12:00:00 Starting working...' }]);
       await adapter.sendMessage('stream:1:T', 'the answer');
       mockFetch.mockClear();
 
       await adapter.finalizeStream('stream:1:T');
 
-      // The status message (id 900) is edited to append the closing line.
-      expect(contentOf(patchTo(900))).toContain('Done working.');
-      // No standalone "Done working." POST — the marker was appended to the status message.
+      // The closing marker is a STANDALONE bottom POST — the user reads the terminal
+      // signal at the end, not appended to the top "Starting working..." status message.
       const standalone = messagePosts().find(p => contentOf(p).includes('Done working.'));
-      expect(standalone).toBeUndefined();
+      expect(standalone).toBeDefined();
+      // The status message (id 900) is NOT patched with a closing line...
+      expect(patchTo(900)).toBeUndefined();
+      // ...but its FIFO entry is consumed (drained) so a later batch turn can't edit it stale.
+      expect(queues.has('stream:1:T')).toBe(false);
     });
 
     test('safety fallback: a post error mid-stream still delivers the answer at finalize', async () => {

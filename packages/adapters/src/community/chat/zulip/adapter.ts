@@ -499,19 +499,19 @@ export class ZulipAdapter implements IPlatformAdapter {
           }
         }
       }
-      // Guaranteed end-of-turn marker. If a status message exists, append the closing
-      // line to it; otherwise post a standalone marker so the turn is ALWAYS clearly
-      // terminated (a stream turn where the status message was never created — e.g. a
-      // failed/uncaptured status POST — would otherwise end with no "done" signal).
-      const appended = await this.postClosingStatus(conversationId);
-      if (!appended) {
-        const ctx = this.replyContexts.get(conversationId);
-        if (ctx) {
-          try {
-            await this.postChunk(ctx, `${formatUtcTime()} Done working.`);
-          } catch (error) {
-            getLog().warn({ err: error, conversationId }, 'zulip.closing_marker_post_failed');
-          }
+      // Guaranteed end-of-turn marker. Always a STANDALONE post at the BOTTOM of the
+      // topic (the "Starting working..." status message sits far above a long streamed
+      // answer — the user needs the terminal signal at the end, where they're reading).
+      // First consume this conversation's status FIFO entry WITHOUT editing it, so a
+      // later batch-mode turn doesn't edit a now-stale status message; the top
+      // "Starting working..." line is left as the start-marker.
+      this.consumeStatusEntry(conversationId);
+      const ctx = this.replyContexts.get(conversationId);
+      if (ctx) {
+        try {
+          await this.postChunk(ctx, `${formatUtcTime()} Done working.`);
+        } catch (error) {
+          getLog().warn({ err: error, conversationId }, 'zulip.closing_marker_post_failed');
         }
       }
       await this.markOldestPendingRead(conversationId);
@@ -523,26 +523,24 @@ export class ZulipAdapter implements IPlatformAdapter {
   }
 
   /**
-   * Append the closing "Done working." line to the conversation's status message.
-   * Consumes the same FIFO entry the batch path would. Returns `true` if a status
-   * message was edited, `false` if none existed (so finalizeStream can post a
-   * standalone marker instead).
+   * Consume (shift + clear) this conversation's oldest status FIFO entry WITHOUT editing
+   * the message. Stream mode posts its closing marker as a standalone bottom message, but
+   * still drains the FIFO here so a later batch-mode turn on the same conversation doesn't
+   * edit a now-stale status message. The "Starting working..." line stays as the top
+   * start-marker. No-op if no status entry exists.
    */
-  private async postClosingStatus(conversationId: string): Promise<boolean> {
+  private consumeStatusEntry(conversationId: string): void {
     const statusQueue = this.statusMessageQueues.get(conversationId);
-    if (!statusQueue || statusQueue.length === 0) return false;
+    if (!statusQueue || statusQueue.length === 0) return;
     const statusEntry = statusQueue.shift();
     if (statusEntry === undefined) {
       getLog().error({ conversationId }, 'zulip.status_queue_inconsistency');
-      return false;
+      return;
     }
     if (statusQueue.length === 0) {
       this.statusMessageQueues.delete(conversationId);
       this.statusLastEdit.delete(conversationId);
     }
-    const newText = `${statusEntry.text}\n${formatUtcTime()} Done working.`;
-    await this.updateMessage(statusEntry.id, newText);
-    return true;
   }
 
   /**

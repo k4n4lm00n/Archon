@@ -74,7 +74,7 @@ The bot responds to:
 - **Stream messages** when @mentioned: `@**Archon** help me with this code`. The reply lands in the same stream + topic.
 - **Direct messages** sent to the bot — replies go back as DMs.
 
-A stream + topic pair (or the set of DM recipients) is treated as one conversation. While the bot is working, it edits a `Starting working…` status message so you get immediate visual feedback; it switches to `Done working.` (or `Done working (FAILED).`) when the reply lands. In `stream` mode the turn always ends with a `Done working.` marker (appended to the status message, or posted standalone if no status message was created).
+A stream + topic pair (or the set of DM recipients) is treated as one conversation. While the bot is working, it posts a `Starting working…` status message so you get immediate visual feedback. In `batch` mode that same status message is edited to `Done working.` (or `Done working (FAILED).`) when the reply lands. In `stream` mode the turn always ends with a standalone `Done working.` marker posted at the **bottom** of the topic — right where you're reading the streamed answer — so you can tell the turn is finished.
 
 Tool calls and reasoning ("thinking") are rendered as collapsible Zulip **spoiler** blocks — the tool's JSON input and the reasoning text are nested in code fences so they stay compact and monospaced instead of expanding inline.
 
