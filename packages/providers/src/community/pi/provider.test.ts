@@ -370,6 +370,7 @@ describe('PiProvider', () => {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.ANTHROPIC_OAUTH_TOKEN;
     delete process.env.ARCHON_PI_AUTH_PATH;
+    delete process.env.ARCHON_PI_AGENT_DIR;
     // The extension-loader cache is module-level and persists across tests;
     // clear it so each test starts with an empty cache and sees its own
     // construct/reload calls (issue #1877).
@@ -590,6 +591,61 @@ describe('PiProvider', () => {
     );
 
     expect(mockModelRuntimeCreate).toHaveBeenCalledWith({ authPath: '/shell/override/auth.json' });
+  });
+
+  test('ARCHON_PI_AGENT_DIR threads the profile dir into settings, auth, and the loader', async () => {
+    // Per-topic Pi profile selection: a codebase env var ARCHON_PI_AGENT_DIR
+    // (archon.db → requestOptions.env) must reach every agent-dir consumer —
+    // SettingsManager (profile defaultModel/settings), ModelRuntime (the
+    // profile's auth.json), and DefaultResourceLoader (the profile's
+    // extension set + steering).
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: { enableExtensions: false },
+        env: { ARCHON_PI_AGENT_DIR: '/profiles/lean' },
+      })
+    );
+
+    expect(mockSettingsManagerCreate).toHaveBeenCalledWith('/tmp', '/profiles/lean');
+    expect(mockModelRuntimeCreate).toHaveBeenCalledWith({ authPath: '/profiles/lean/auth.json' });
+    const loaderOpts = MockDefaultResourceLoader.mock.calls[0]?.[0] as { agentDir?: string };
+    expect(loaderOpts.agentDir).toBe('/profiles/lean');
+  });
+
+  test('ARCHON_PI_AUTH_PATH (per-user credential delivery) wins over the agent-dir auth.json', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        env: {
+          ARCHON_PI_AGENT_DIR: '/profiles/lean',
+          ARCHON_PI_AUTH_PATH: '/per-run/auth.json',
+        },
+      })
+    );
+
+    expect(mockModelRuntimeCreate).toHaveBeenCalledWith({ authPath: '/per-run/auth.json' });
+  });
+
+  test('without ARCHON_PI_AGENT_DIR the loader falls back to the default agent dir', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        assistantConfig: { enableExtensions: false },
+      })
+    );
+
+    const loaderOpts = MockDefaultResourceLoader.mock.calls[0]?.[0] as { agentDir?: string };
+    expect(loaderOpts.agentDir).toBe('/mock/.pi/agent');
   });
 
   test('ModelRuntime.create() throwing surfaces a contextualized error', async () => {
@@ -2441,7 +2497,9 @@ describe('PiProvider', () => {
     );
 
     expect(mockSettingsManagerCreate).toHaveBeenCalledTimes(1);
-    expect(mockSettingsManagerCreate).toHaveBeenCalledWith('/tmp');
+    // Second arg is the per-request agent-dir override; undefined preserves
+    // SettingsManager.create's own getAgentDir() default (stock behavior).
+    expect(mockSettingsManagerCreate).toHaveBeenCalledWith('/tmp', undefined);
     expect(mockSettingsManagerInMemory).toHaveBeenCalledWith({ defaultProvider: 'google' });
   });
 
@@ -2605,6 +2663,31 @@ describe('PiProvider', () => {
       expect(a).not.toBe(b);
       expect(MockDefaultResourceLoader).toHaveBeenCalledTimes(2);
       expect(mockResourceLoaderReload).toHaveBeenCalledTimes(2);
+    });
+
+    test('distinct agentDir gets its own reloaded loader; equal agentDir shares one', async () => {
+      // The agent dir IS the profile (extension set + steering): two profiles
+      // must never share a loader, while repeat calls for one profile must.
+      const a = await getOrCreateReloadedExtensionLoader('/tmp', { agentDir: '/profiles/lean' });
+      const b = await getOrCreateReloadedExtensionLoader('/tmp', {});
+      const c = await getOrCreateReloadedExtensionLoader('/tmp', { agentDir: '/profiles/lean' });
+      expect(a).not.toBe(b);
+      expect(c).toBe(a);
+      expect(MockDefaultResourceLoader).toHaveBeenCalledTimes(2);
+      expect(mockResourceLoaderReload).toHaveBeenCalledTimes(2);
+      const optsA = MockDefaultResourceLoader.mock.calls[0]?.[0] as { agentDir?: string };
+      expect(optsA.agentDir).toBe('/profiles/lean');
+    });
+
+    test('explicit agentDir equal to the default shares the default cache entry', async () => {
+      // The cache keys the EFFECTIVE dir, so an explicit override equal to
+      // getAgentDir() must not create a duplicate loader for the same profile.
+      const a = await getOrCreateReloadedExtensionLoader('/tmp', {
+        agentDir: '/mock/.pi/agent',
+      });
+      const b = await getOrCreateReloadedExtensionLoader('/tmp', {});
+      expect(b).toBe(a);
+      expect(MockDefaultResourceLoader).toHaveBeenCalledTimes(1);
     });
 
     test('concurrent callers (same key) share a single in-flight reload (the documented invariant)', async () => {

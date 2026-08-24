@@ -24,6 +24,20 @@ export interface NoopResourceLoaderOptions {
   systemPrompt?: string;
 
   /**
+   * Override the Pi agent dir (the directory that IS a Pi profile: its
+   * settings.json packages list, npm/ extension installs, APPEND_SYSTEM.md
+   * steering, and — via extensions that accept an explicit config path —
+   * mcp.json). When omitted, Pi's own `getAgentDir()` applies (honors
+   * `PI_CODING_AGENT_DIR`, defaults to `~/.pi/agent`).
+   *
+   * Threaded from the per-request `ARCHON_PI_AGENT_DIR` env var (codebase
+   * env vars in archon.db → requestOptions.env) so one server process can
+   * serve different Pi profiles per codebase/topic — e.g. a lean local-LLM
+   * profile next to the full default profile.
+   */
+  agentDir?: string;
+
+  /**
    * Absolute paths to specific skill directories (each containing a SKILL.md)
    * that Pi should load in addition to its default discovery. Works even with
    * `noSkills: true` — Pi's loader merges additional paths regardless, per
@@ -83,9 +97,11 @@ export function createNoopResourceLoader(
   return new DefaultResourceLoader({
     cwd,
     // Required since pi-coding-agent 0.71 dropped the implicit fallback.
-    // Calling Pi's own `getAgentDir()` honors `PI_CODING_AGENT_DIR` and
-    // matches the behavior of the pre-0.71 default exactly.
-    agentDir: getAgentDir(),
+    // An explicit per-request override (see NoopResourceLoaderOptions.agentDir)
+    // wins; otherwise call Pi's own `getAgentDir()`, which honors
+    // `PI_CODING_AGENT_DIR` and matches the behavior of the pre-0.71 default
+    // exactly.
+    agentDir: options.agentDir ?? getAgentDir(),
     noExtensions: options.enableExtensions !== true,
     noSkills: true,
     noPromptTemplates: true,
@@ -175,13 +191,20 @@ export interface ReloadedExtensionLoader {
  * reuses a loader carrying a different prompt — a distinct prompt yields a
  * distinct loader (which is reloaded once on its own). In the common case
  * (uniform/absent prompt across nodes) all nodes share one cached loader.
+ *
+ * `agentDir` is part of the key because the agent dir IS the profile: two
+ * requests with different agent dirs load different extension sets and
+ * steering, so they must never share a loader. The EFFECTIVE dir
+ * (`options.agentDir ?? getAgentDir()`) is keyed, so an explicit override
+ * that equals the default still shares the default's cached loader.
  */
 function extensionLoaderCacheKey(
   cwd: string,
   systemPrompt: string | undefined,
-  additionalSkillPaths: readonly string[]
+  additionalSkillPaths: readonly string[],
+  agentDir: string
 ): string {
-  return JSON.stringify([cwd, systemPrompt ?? null, [...additionalSkillPaths].sort()]);
+  return JSON.stringify([cwd, systemPrompt ?? null, [...additionalSkillPaths].sort(), agentDir]);
 }
 
 /**
@@ -198,12 +221,16 @@ function extensionLoaderCacheKey(
  */
 export async function getOrCreateReloadedExtensionLoader(
   cwd: string,
-  options: Pick<NoopResourceLoaderOptions, 'systemPrompt' | 'additionalSkillPaths'> = {}
+  options: Pick<
+    NoopResourceLoaderOptions,
+    'systemPrompt' | 'additionalSkillPaths' | 'agentDir'
+  > = {}
 ): Promise<ReloadedExtensionLoader> {
   const key = extensionLoaderCacheKey(
     cwd,
     options.systemPrompt,
-    options.additionalSkillPaths ?? []
+    options.additionalSkillPaths ?? [],
+    options.agentDir ?? getAgentDir()
   );
   let pending = reloadedExtensionLoaderCache.get(key);
   if (!pending) {

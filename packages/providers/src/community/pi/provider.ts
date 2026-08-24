@@ -412,6 +412,25 @@ export class PiProvider implements IAgentProvider {
     const assistantConfig = requestOptions?.assistantConfig ?? {};
     const piConfig = parsePiConfig(assistantConfig);
 
+    // Per-request Pi agent-dir override (profile selection). An agent dir IS a
+    // Pi profile — settings.json packages, npm/ extension installs,
+    // APPEND_SYSTEM.md steering — so this one knob swaps the whole toolset.
+    // Delivered like ARCHON_PI_AUTH_PATH: as a codebase env var in archon.db
+    // (remote_agent_codebase_env_vars → orchestrator effectiveEnv →
+    // requestOptions.env), with process.env as a shell-level fallback. Scoping
+    // a topic to a codebase that carries ARCHON_PI_AGENT_DIR gives that topic
+    // its own profile (e.g. a lean local-LLM dir) while every other topic
+    // keeps the default `~/.pi/agent`.
+    //
+    // Threaded into: SettingsManager (defaultModel fallback + session
+    // settings), the ResourceLoader (extension discovery + loader cache key),
+    // auth.json resolution (below), and the models-store fallback (LOOKUP-2).
+    // Pi session JSONLs deliberately stay under the default sessions dir —
+    // resume is keyed by (cwd, session id) and works across profiles.
+    const archonAgentDir =
+      (requestOptions?.env?.ARCHON_PI_AGENT_DIR ?? process.env.ARCHON_PI_AGENT_DIR)?.trim() ||
+      undefined;
+
     // 0. Apply config-level env vars to process.env for in-process extensions
     //    (plannotator reads PLANNOTATOR_REMOTE at session_start, etc.).
     //    Shell env wins: we only set keys not already present. Request-level
@@ -440,7 +459,10 @@ export class PiProvider implements IAgentProvider {
     let modelRef = requestOptions?.model ?? piConfig.model;
     if (!modelRef) {
       try {
-        const settingsManager = piCodingAgent.SettingsManager.create(cwd);
+        // `create(cwd, agentDir?)` defaults its second parameter to Pi's own
+        // getAgentDir(), so passing undefined preserves stock behavior; the
+        // override makes the profile's own defaultModel win for its topics.
+        const settingsManager = piCodingAgent.SettingsManager.create(cwd, archonAgentDir);
         const settings = settingsManager.getGlobalSettings();
         // SettingsManager records malformed/unreadable settings via
         // drainErrors() rather than throwing, so a broken settings.json yields
@@ -497,10 +519,15 @@ export class PiProvider implements IAgentProvider {
       const archonAuthPath =
         (requestOptions?.env?.ARCHON_PI_AUTH_PATH ?? process.env.ARCHON_PI_AUTH_PATH)?.trim() ||
         undefined;
+      // Auth precedence: per-run ARCHON_PI_AUTH_PATH (per-user credential
+      // delivery) > the selected profile's own auth.json (agent-dir override)
+      // > Pi's default ($PI_CODING_AGENT_DIR/auth.json or ~/.pi/agent/auth.json).
+      const effectiveAuthPath =
+        archonAuthPath ?? (archonAgentDir ? join(archonAgentDir, 'auth.json') : undefined);
       // 0.83.0: ModelRuntime.create({ authPath }) replaces AuthStorage.create();
       // ModelRegistry is now constructed from the runtime (was ModelRegistry.create(authStorage)).
       modelRuntime = await piCodingAgent.ModelRuntime.create(
-        archonAuthPath ? { authPath: archonAuthPath } : undefined
+        effectiveAuthPath ? { authPath: effectiveAuthPath } : undefined
       );
       // #2654 credential boundary (ported to the 0.83 seam): a custom provider
       // (no Archon env-var shortcut) may resolve its models.json config
@@ -728,7 +755,7 @@ export class PiProvider implements IAgentProvider {
     // settingsManager.reload(), which resets InMemorySettingsStorage to {} (the
     // storage's global/project fields are undefined after inMemory() construction,
     // so reload() produces empty settings, wiping all loaded user preferences).
-    const fileSettings = piCodingAgent.SettingsManager.create(cwd);
+    const fileSettings = piCodingAgent.SettingsManager.create(cwd, archonAgentDir);
 
     // Drain and log any settings file parse errors (malformed JSON, etc.) — non-fatal.
     const settingsErrors = fileSettings.drainErrors();
@@ -798,6 +825,7 @@ export class PiProvider implements IAgentProvider {
     const loaderOptions = {
       ...(systemPrompt !== undefined ? { systemPrompt } : {}),
       ...(skillPaths.length > 0 ? { additionalSkillPaths: skillPaths } : {}),
+      ...(archonAgentDir !== undefined ? { agentDir: archonAgentDir } : {}),
     };
     let resourceLoader: DefaultResourceLoader;
     if (enableExtensions) {
@@ -853,6 +881,7 @@ export class PiProvider implements IAgentProvider {
         missingSkillCount: missingSkills.length,
         extensionsEnabled: enableExtensions,
         interactive,
+        ...(archonAgentDir !== undefined ? { agentDir: archonAgentDir } : {}),
         nodeId: nodeConfig?.nodeId,
         resumed: resumeSessionId !== undefined && !resumeFailed,
       },
@@ -996,7 +1025,7 @@ export class PiProvider implements IAgentProvider {
       // extension's async timing.
       if (!model) {
         const stored = readExtensionModelFromStore(
-          piCodingAgent.getAgentDir(),
+          archonAgentDir ?? piCodingAgent.getAgentDir(),
           parsed.provider,
           parsed.modelId
         );
