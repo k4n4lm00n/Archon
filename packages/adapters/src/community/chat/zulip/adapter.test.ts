@@ -326,6 +326,42 @@ describe('ZulipAdapter', () => {
         return Promise.resolve({ messages: isMention ? mentions : dms });
       });
 
+    test('re-registering the event queue after a poll error runs the catch-up backfill again', async () => {
+      process.env.ZULIP_BOT_FULL_NAME = 'TestBot';
+      try {
+        const adapter = new ZulipAdapter('https://test.zulipchat.com', 'bot@test.com', 'key');
+        adapter.onMessage(() => Promise.resolve());
+        retrieveReturning([], []);
+        // First long-poll fails (queue expired / link dropped), every later one blocks.
+        let polls = 0;
+        mockEventsRetrieve.mockImplementation(() => {
+          polls += 1;
+          return polls === 1
+            ? Promise.reject(new Error('BAD_EVENT_QUEUE_ID'))
+            : new Promise(() => {});
+        });
+        const unreadFetches = (): number =>
+          mockMessagesRetrieve.mock.calls.filter(c =>
+            (c[0] as { narrow: { operand: string }[] }).narrow.some(n => n.operand === 'unread')
+          ).length;
+
+        await adapter.start();
+        await flush();
+        await flush();
+        await flush();
+
+        // Boot backfill (mentions + DMs = 2 fetches) plus one more pass after the re-register.
+        expect(unreadFetches()).toBe(4);
+        const registers = mockFetch.mock.calls.filter(c =>
+          String(c[0]).endsWith('/api/v1/register')
+        );
+        expect(registers.length).toBe(2);
+        adapter.stop();
+      } finally {
+        delete process.env.ZULIP_BOT_FULL_NAME;
+      }
+    });
+
     test('registers the queue (direct POST) with apply_markdown=false for raw-markdown mentions', async () => {
       const adapter = new ZulipAdapter('https://test.zulipchat.com', 'bot@test.com', 'key');
       mockEventsRetrieve.mockImplementation(() => new Promise(() => {})); // block live loop
@@ -403,7 +439,7 @@ describe('ZulipAdapter', () => {
       }
     });
 
-    test('marks an incoming message read only after a reply is posted', async () => {
+    test('marks an incoming message read only after a reply is posted (inside its turn)', async () => {
       process.env.ZULIP_BOT_FULL_NAME = 'TestBot';
       try {
         const adapter = new ZulipAdapter('https://test.zulipchat.com', 'bot@test.com', 'key');
@@ -420,7 +456,8 @@ describe('ZulipAdapter', () => {
           mockFetch.mock.calls.filter(c => String(c[0]).endsWith('/api/v1/messages/flags')).length
         ).toBe(0);
 
-        // Posting a reply to that conversation marks the queued id read.
+        // The server wiring brackets the orchestrator turn; a reply inside it acks message 10.
+        adapter.beginTurn('stream:1:topic', 10);
         await adapter.sendMessage('stream:1:topic', 'hi back');
 
         const flags = mockFetch.mock.calls.filter(c =>
@@ -430,6 +467,56 @@ describe('ZulipAdapter', () => {
         expect(decodeURIComponent(String((flags[0]![1] as { body?: unknown }).body))).toContain(
           'messages=[10]'
         );
+        // A second terminal send in the same turn does not ack twice.
+        await adapter.sendMessage('stream:1:topic', 'and more');
+        expect(
+          mockFetch.mock.calls.filter(c => String(c[0]).endsWith('/api/v1/messages/flags')).length
+        ).toBe(1);
+        await adapter.endTurn('stream:1:topic', 10);
+      } finally {
+        delete process.env.ZULIP_BOT_FULL_NAME;
+      }
+    });
+
+    test('a reply outside any turn acks nothing (no FIFO to drift)', async () => {
+      const adapter = new ZulipAdapter('https://test.zulipchat.com', 'bot@test.com', 'key');
+      (adapter as unknown as { client: typeof mockZulipClient }).client = mockZulipClient;
+      (adapter as unknown as { replyContexts: Map<string, ZulipReplyContext> }).replyContexts.set(
+        'stream:1:topic',
+        { type: 'stream', stream_id: 1, topic: 'topic' }
+      );
+      await adapter.sendMessage('stream:1:topic', 'orphan reply');
+      expect(
+        mockFetch.mock.calls.filter(c => String(c[0]).endsWith('/api/v1/messages/flags')).length
+      ).toBe(0);
+    });
+
+    test('a turn that ends without a reply leaves its message unread and does not shift later acks', async () => {
+      process.env.ZULIP_BOT_FULL_NAME = 'TestBot';
+      try {
+        const adapter = new ZulipAdapter('https://test.zulipchat.com', 'bot@test.com', 'key');
+        (adapter as unknown as { client: typeof mockZulipClient }).client = mockZulipClient;
+        adapter.onMessage(() => Promise.resolve());
+        const inbound = (
+          adapter as unknown as { handleIncomingMessage: (m: ZulipMessage) => Promise<void> }
+        ).handleIncomingMessage.bind(adapter);
+        const flagBodies = (): string[] =>
+          mockFetch.mock.calls
+            .filter(c => String(c[0]).endsWith('/api/v1/messages/flags'))
+            .map(c => decodeURIComponent(String((c[1] as { body?: unknown }).body)));
+
+        // Turn 1 (message 10): the handler throws before anything is posted.
+        await inbound(mention(10));
+        adapter.beginTurn('stream:1:topic', 10);
+        await adapter.endTurn('stream:1:topic', 10);
+        expect(flagBodies()).toEqual([]);
+
+        // Turn 2 (message 11) replies normally: it must ack 11, not the leaked 10.
+        await inbound({ ...mention(11), id: 11 });
+        adapter.beginTurn('stream:1:topic', 11);
+        await adapter.sendMessage('stream:1:topic', 'answer to 11');
+        await adapter.endTurn('stream:1:topic', 11);
+        expect(flagBodies()).toEqual(['messages=[11]&op=add&flag=read']);
       } finally {
         delete process.env.ZULIP_BOT_FULL_NAME;
       }
@@ -1098,6 +1185,38 @@ describe('ZulipAdapter stream mode', () => {
       await adapter.emitRetract('stream:1:T');
     });
 
+    test('endTurn flushes a streamed turn that never got finalizeStream and acks the message', async () => {
+      const adapter = streamAdapter();
+      adapter.beginTurn('stream:1:T', 42);
+      // A command-style reply: streamed chunk, then the turn ends without finalizeStream.
+      await adapter.sendMessage('stream:1:T', 'Session cleared.');
+      expect(messagePosts().length).toBe(0);
+      await adapter.endTurn('stream:1:T', 42);
+
+      const posts = messagePosts();
+      // The buffered text is posted, but NO "Done working." marker (that is finalizeStream's).
+      expect(posts.length).toBe(1);
+      expect(contentOf(posts[0])).toBe('Session cleared.');
+      const flags = mockFetch.mock.calls.filter(c =>
+        String(c[0]).endsWith('/api/v1/messages/flags')
+      );
+      expect(flags.length).toBe(1);
+      expect(decodeURIComponent(String((flags[0]![1] as { body?: unknown }).body))).toContain(
+        'messages=[42]'
+      );
+      expect(turnsOf(adapter).has('stream:1:T')).toBe(false);
+    });
+
+    test('endTurn with nothing streamed posts nothing and leaves the message unread', async () => {
+      const adapter = streamAdapter();
+      adapter.beginTurn('stream:1:T', 43);
+      await adapter.endTurn('stream:1:T', 43);
+      expect(messagePosts().length).toBe(0);
+      expect(
+        mockFetch.mock.calls.filter(c => String(c[0]).endsWith('/api/v1/messages/flags')).length
+      ).toBe(0);
+    });
+
     test('two chunks coalesce into one combined POST at finalizeStream', async () => {
       const adapter = streamAdapter();
       await adapter.sendMessage('stream:1:T', 'Hello ');
@@ -1152,7 +1271,9 @@ describe('ZulipAdapter stream mode', () => {
         });
         mockFetch.mockClear();
 
+        adapter.beginTurn('stream:1:topic', 100);
         await adapter.finalizeStream('stream:1:topic');
+        await adapter.endTurn('stream:1:topic', 100);
 
         // Closing marker is a STANDALONE bottom POST (not an edit of the top status message).
         const marker = messagePosts().find(p => contentOf(p).includes('Done working.'));
@@ -1160,11 +1281,14 @@ describe('ZulipAdapter stream mode', () => {
         // The status message (id 500) must NOT be patched with a closing line — it is left
         // as the top "Starting working..." start-marker (its FIFO entry is consumed silently).
         expect(patchTo(500)).toBeUndefined();
-        // Mark-read POST to messages/flags.
-        const markRead = mockFetch.mock.calls.find(c =>
+        // Mark-read POST to messages/flags — exactly once, for the turn's message.
+        const markReads = mockFetch.mock.calls.filter(c =>
           String(c[0]).endsWith('/api/v1/messages/flags')
         );
-        expect(markRead).toBeDefined();
+        expect(markReads.length).toBe(1);
+        expect(decodeURIComponent(String((markReads[0]![1] as { body?: unknown }).body))).toContain(
+          'messages=[100]'
+        );
       } finally {
         delete process.env.ZULIP_BOT_FULL_NAME;
       }

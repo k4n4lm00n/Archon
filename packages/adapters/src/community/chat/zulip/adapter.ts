@@ -88,9 +88,19 @@ export class ZulipAdapter implements IPlatformAdapter {
   private allowedUserIds: number[];
   private replyContexts = new Map<string, ZulipReplyContext>();
   private processedMessageIds = new Set<number>();
-  // conversationId -> incoming message ids awaiting a reply; marked read only once a reply
-  // is actually posted, so a failed send leaves the message unread for the next boot to retry.
-  private pendingReadIds = new Map<string, number[]>();
+  // conversationId -> the inbound message whose turn is running right now. Set by
+  // `beginTurn` (the server wiring calls it inside the per-conversation lock) and cleared by
+  // `endTurn`. The message is marked read only once a reply is actually posted, so a turn that
+  // dies before replying leaves it unread for the next boot's backfill to retry.
+  //
+  // This replaced a per-conversation FIFO of pending ids: the adapter never learns when a turn
+  // ends (the handler is fire-and-forget), so any turn that ended without a reply — a throw
+  // before the stream handler's `finally`, a command reply that never finalizes — left its id
+  // in the FIFO and every later reply acked the WRONG (older) message. The newest message in
+  // such a topic then stayed unread forever and got re-answered on every restart.
+  private activeTurns = new Map<string, { messageId: number; markedRead: boolean }>();
+  // Guards against overlapping catch-up passes (boot + a queue re-register in quick succession).
+  private backfillInFlight = false;
   // conversationId -> FIFO queue of status messages awaiting their answer or error.
   // Each entry holds the Zulip message_id and accumulated text (full replacement on edit).
   private statusMessageQueues = new Map<string, { id: number; text: string }[]>();
@@ -241,35 +251,69 @@ export class ZulipAdapter implements IPlatformAdapter {
 
     if (isError) {
       await this.postChunk(ctx, text);
-      await this.markOldestPendingRead(conversationId);
+      await this.markTurnRead(conversationId);
       return;
     }
 
     // Partial-delivery contract: Zulip has no atomic multi-post API and we don't retract earlier
     // chunks if a later one fails. A throw mid-loop therefore leaves the user with a truncated
     // answer in the topic — the throw bubbles up to the caller's logging, and the inbound message
-    // is intentionally NOT marked read (see markOldestPendingRead) so the next boot can retry.
+    // is intentionally NOT marked read (see markTurnRead) so the next boot can retry.
     const chunks = text.length > MAX_LENGTH ? splitIntoAtomicChunks(text, MAX_LENGTH) : [text];
     for (const chunk of chunks) {
       await this.postChunk(ctx, chunk);
     }
 
-    await this.markOldestPendingRead(conversationId);
+    await this.markTurnRead(conversationId);
   }
 
   /**
-   * Mark exactly one pending inbound message (the oldest, FIFO) read for this conversation —
-   * the message this reply answers. Each inbound message produces one terminal `sendMessage`
-   * (answer or error) and pushes one id via `handleIncomingMessage`, mirroring the status-message
-   * FIFO. Draining the whole list per reply would ack still-unanswered messages: with two queued,
-   * the first reply would mark both read, and a crash before the second reply posts would lose it.
+   * Turn boundary: the server wiring calls this inside the per-conversation lock, right before
+   * it hands `messageId` to the orchestrator. From here until `endTurn`, every reply posted to
+   * `conversationId` answers this message — so this is the id that mark-read acks.
    */
-  private async markOldestPendingRead(conversationId: string): Promise<void> {
-    const pending = this.pendingReadIds.get(conversationId);
-    if (!pending || pending.length === 0) return;
-    const id = pending.shift();
-    if (pending.length === 0) this.pendingReadIds.delete(conversationId);
-    if (id !== undefined) await this.markRead(id);
+  beginTurn(conversationId: string, messageId: number): void {
+    const stale = this.activeTurns.get(conversationId);
+    if (stale) {
+      getLog().warn(
+        { conversationId, staleMessageId: stale.messageId, messageId },
+        'zulip.turn_overlap'
+      );
+    }
+    this.activeTurns.set(conversationId, { messageId, markedRead: false });
+  }
+
+  /**
+   * Turn boundary: the server wiring calls this in the lock's `finally`, whatever the outcome.
+   * A stream turn still open here ended without `finalizeStream` (a command reply, a throw
+   * before the stream handler's `finally`): flush what was streamed and ack the inbound message
+   * if anything was posted. A turn that posted nothing leaves its message unread on purpose —
+   * the next boot's backfill retries it. Never throws.
+   */
+  async endTurn(conversationId: string, messageId: number): Promise<void> {
+    const turn = this.activeTurns.get(conversationId);
+    if (turn?.messageId !== messageId) return;
+    try {
+      if (this.streamTurns.has(conversationId)) {
+        await this.closeStreamTurn(conversationId, false);
+      }
+    } catch (error) {
+      getLog().warn({ err: error, conversationId, messageId }, 'zulip.end_turn_failed');
+    } finally {
+      if (this.activeTurns.get(conversationId) === turn) this.activeTurns.delete(conversationId);
+    }
+  }
+
+  /**
+   * Mark the inbound message of the running turn read — the message this reply answers.
+   * Idempotent per turn (a turn may hit several terminal paths, e.g. finalizeStream + endTurn).
+   * No-op outside a turn (bare adapter use, or a reply after the turn already ended).
+   */
+  private async markTurnRead(conversationId: string): Promise<void> {
+    const turn = this.activeTurns.get(conversationId);
+    if (turn?.markedRead !== false) return;
+    turn.markedRead = true;
+    await this.markRead(turn.messageId);
   }
 
   /** Post a single chunk to the correct Zulip conversation (stream or DM). Throws on failure. */
@@ -454,15 +498,17 @@ export class ZulipAdapter implements IPlatformAdapter {
     ctx: ZulipReplyContext,
     turn: ZulipStreamTurn,
     text: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       const chunks = text.length > MAX_LENGTH ? splitIntoAtomicChunks(text, MAX_LENGTH) : [text];
       for (const chunk of chunks) {
         const id = await this.postChunkCapture(ctx, chunk);
         if (id !== undefined) turn.postedMsgIds.push(id);
       }
+      return true;
     } catch (error) {
       getLog().error({ err: error, conversationId }, 'zulip.stream_final_post_failed');
+      return false;
     }
   }
 
@@ -473,7 +519,18 @@ export class ZulipAdapter implements IPlatformAdapter {
    * Best-effort: logs and never throws.
    */
   async finalizeStream(conversationId: string): Promise<void> {
+    await this.closeStreamTurn(conversationId, true);
+  }
+
+  /**
+   * Shared tail of a streamed turn. `postMarker` = the orchestrator's real finish signal
+   * (finalizeStream): post the closing "Done working." line and ack the inbound message.
+   * Without it (endTurn on a turn that never got finalized) only what was actually streamed
+   * is flushed, and the inbound message is acked only if something was posted.
+   */
+  private async closeStreamTurn(conversationId: string, postMarker: boolean): Promise<void> {
     const turn = this.streamTurns.get(conversationId);
+    let posted = false;
     try {
       if (turn) {
         if (turn.flushTimer) {
@@ -486,18 +543,21 @@ export class ZulipAdapter implements IPlatformAdapter {
           if (turn.style === 'edit') {
             if (turn.fellBackToBatch) {
               if (turn.rendered)
-                await this.postFinalBatched(conversationId, ctx, turn, turn.rendered);
+                posted = await this.postFinalBatched(conversationId, ctx, turn, turn.rendered);
             } else if (turn.editMsgId !== undefined) {
               await this.updateMessage(turn.editMsgId, turn.rendered);
+              posted = true;
             } else if (turn.rendered) {
-              await this.postFinalBatched(conversationId, ctx, turn, turn.rendered);
+              posted = await this.postFinalBatched(conversationId, ctx, turn, turn.rendered);
             }
           } else if (turn.buffer) {
             // post style: post whatever hasn't been posted (fell back or last window).
-            await this.postFinalBatched(conversationId, ctx, turn, turn.buffer);
+            posted = await this.postFinalBatched(conversationId, ctx, turn, turn.buffer);
             turn.buffer = '';
           }
         }
+        // Earlier coalescing windows may already have posted chunk-messages this turn.
+        posted = posted || turn.postedMsgIds.length > 0 || turn.editMsgId !== undefined;
       }
       // Guaranteed end-of-turn marker. Always a STANDALONE post at the BOTTOM of the
       // topic (the "Starting working..." status message sits far above a long streamed
@@ -507,14 +567,14 @@ export class ZulipAdapter implements IPlatformAdapter {
       // "Starting working..." line is left as the start-marker.
       this.consumeStatusEntry(conversationId);
       const ctx = this.replyContexts.get(conversationId);
-      if (ctx) {
+      if (postMarker && ctx) {
         try {
           await this.postChunk(ctx, `${formatUtcTime()} Done working.`);
         } catch (error) {
           getLog().warn({ err: error, conversationId }, 'zulip.closing_marker_post_failed');
         }
       }
-      await this.markOldestPendingRead(conversationId);
+      if (postMarker || posted) await this.markTurnRead(conversationId);
     } catch (error) {
       getLog().warn({ err: error, conversationId }, 'zulip.finalize_stream_failed');
     } finally {
@@ -653,7 +713,21 @@ export class ZulipAdapter implements IPlatformAdapter {
   private async backfillUnansweredMessages(): Promise<void> {
     const client = this.client;
     if (!client) return;
+    if (this.backfillInFlight) {
+      getLog().info('zulip.backfill_already_running');
+      return;
+    }
+    this.backfillInFlight = true;
+    try {
+      await this.backfillUnansweredMessagesInner(client);
+    } finally {
+      this.backfillInFlight = false;
+    }
+  }
 
+  private async backfillUnansweredMessagesInner(
+    client: NonNullable<typeof this.client>
+  ): Promise<void> {
     // Returns `undefined` on failure (vs `[]` = "fetched OK, none unread") so the caller can't
     // mistake a downgraded API for a clean backfill cycle and silently swallow missed messages.
     const fetchUnread = async (
@@ -835,6 +909,7 @@ export class ZulipAdapter implements IPlatformAdapter {
 
     let queueId = initialQueueId;
     let lastEventId = initialLastEventId;
+    let reregisterBackoffMs = 1000;
 
     while (this.running) {
       try {
@@ -868,9 +943,24 @@ export class ZulipAdapter implements IPlatformAdapter {
           });
           queueId = String(queueResult.queue_id);
           lastEventId = Number(queueResult.last_event_id ?? -1);
+          reregisterBackoffMs = 1000;
+          getLog().info({ queueId }, 'zulip.queue_reregistered');
+          // A fresh queue only carries events from now on: anything posted while the link was
+          // down (network outage, expired queue) never reaches it. Run the same catch-up as
+          // boot — Zulip's unread @mentions/DMs are the source of truth for "unanswered".
+          // (2026-09-17: a 12h outage swallowed a mention this way; it stayed unanswered.)
+          void this.backfillUnansweredMessages().catch(backfillError => {
+            getLog().error({ err: backfillError }, 'zulip.backfill_fatal_error');
+          });
         } catch (reregisterError) {
-          getLog().error({ err: reregisterError }, 'zulip.reregister_error');
-          await sleep(1000);
+          getLog().error(
+            { err: reregisterError, retryInMs: reregisterBackoffMs },
+            'zulip.reregister_error'
+          );
+          // Back off while the server is unreachable (a 12h outage at 1s produced ~80k
+          // log lines); reset to 1s on the next successful re-register.
+          await sleep(reregisterBackoffMs);
+          reregisterBackoffMs = Math.min(reregisterBackoffMs * 2, 30_000);
         }
       }
     }
@@ -958,13 +1048,9 @@ export class ZulipAdapter implements IPlatformAdapter {
 
     await this.createStatusMessage(conversationId);
 
-    // Defer mark-read until the reply is actually posted (sendMessage). The handler is
-    // fire-and-forget — it returns before the AI response is sent — so marking read here
-    // would mark a message answered before (or even if) the reply ever goes out. Queue the
-    // id against this conversation; sendMessage marks it read once a reply succeeds.
-    const pending = this.pendingReadIds.get(conversationId) ?? [];
-    pending.push(msg.id);
-    this.pendingReadIds.set(conversationId, pending);
+    // Mark-read is deferred until a reply is actually posted: the handler is fire-and-forget
+    // (it returns before the AI response is sent), so the server wiring brackets the real turn
+    // with beginTurn(msg.id) / endTurn(msg.id) and the reply paths ack that id (markTurnRead).
 
     if (this.messageHandler) {
       await this.messageHandler(msg);

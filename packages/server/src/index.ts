@@ -690,13 +690,24 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const content = zulipAdapter.stripBotMention(msg.content);
         if (!content) return;
 
+        const onError = createMessageErrorHandler('Zulip', zulipAdapter, conversationId);
         lockManager
           .acquireLock(conversationId, async () => {
-            await handleMessage(zulipAdapter, conversationId, content, {
-              isolationHints: { workflowType: 'thread', workflowId: conversationId },
-            });
+            // Turn boundaries: the adapter ties every reply posted during this turn (answer,
+            // error, mark-read) to THIS inbound message. The error reply must go out before
+            // endTurn so it still acks the message; the outer catch covers lock failures.
+            zulipAdapter.beginTurn(conversationId, msg.id);
+            try {
+              await handleMessage(zulipAdapter, conversationId, content, {
+                isolationHints: { workflowType: 'thread', workflowId: conversationId },
+              });
+            } catch (error) {
+              await onError(error);
+            } finally {
+              await zulipAdapter.endTurn(conversationId, msg.id);
+            }
           })
-          .catch(createMessageErrorHandler('Zulip', zulipAdapter, conversationId));
+          .catch(onError);
       });
 
       await zulip.start();
