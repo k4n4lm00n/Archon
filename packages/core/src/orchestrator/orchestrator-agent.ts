@@ -20,6 +20,7 @@ import * as db from '../db/conversations';
 import * as codebaseDb from '../db/codebases';
 import * as sessionDb from '../db/sessions';
 import * as commandHandler from '../handlers/command-handler';
+import { resolveCustomCommand, executeAiLessCommand } from '../handlers/custom-command';
 import { classifyAndFormatError } from '../utils/error-formatter';
 import { toError } from '../utils/error';
 import { quoteCommandArg } from '../utils/command-args';
@@ -514,7 +515,23 @@ async function handleDeterministicCommand(
     'worktree',
   ];
 
-  if (!deterministicCommands.includes(command)) return false;
+  if (!deterministicCommands.includes(command)) {
+    // AI-less custom command: a /foo that is not a built-in but resolves to a command file
+    // carrying a `run:` directive executes deterministically (no agent turn). Command files
+    // WITHOUT `run:` fall through to the AI turn, so this is purely additive.
+    const cwd =
+      conversation.cwd ??
+      (conversation.codebase_id
+        ? (await codebaseDb.getCodebase(conversation.codebase_id))?.default_cwd
+        : undefined);
+    const custom = await resolveCustomCommand(command, { cwd });
+    if (custom?.run) {
+      getLog().debug({ command, conversationId, path: custom.path }, 'ailess_custom_command');
+      await deliverCommandResult(await executeAiLessCommand(custom, parsed.args, { cwd }));
+      return true;
+    }
+    return false;
+  }
   getLog().debug({ command, conversationId }, 'deterministic_command');
   if (command === 'register-project') {
     const result = await handleRegisterProject(message);
