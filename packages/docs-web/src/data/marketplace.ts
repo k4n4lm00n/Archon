@@ -222,8 +222,8 @@ export const marketplaceEntries: MarketplaceEntry[] = [
     description:
       'Hot-upgrade a live, long-running server (e.g. an Archon messenger-integrated bot) to newer code from your fork WITHOUT dropping its active communication link. Ensures the `upstream` and `myfork` remotes (forks `upstream` to create `myfork` if missing), snapshots the live instance as a rollback anchor, stages the target ref in an isolated worktree, installs/type-checks/builds/tests, smoke-boots in isolation, then performs a detached, self-healing cutover that keeps every active integration or rolls back.',
     sourceUrl:
-      'https://github.com/k4n4lm00n/archon-self-upgrade/blob/25a6b26759166224634c349c1a2289041502fa4e/archon-self-upgrade.yaml',
-    sha: '25a6b26759166224634c349c1a2289041502fa4e',
+      'https://github.com/k4n4lm00n/archon-self-upgrade/blob/adcbd18af5d1b8d108914f6c206d46086bb7cf9e/archon-self-upgrade.yaml',
+    sha: 'adcbd18af5d1b8d108914f6c206d46086bb7cf9e',
     tags: ['automation', 'development'],
     archonVersionCompat: '>=0.5.0',
   },
