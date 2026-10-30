@@ -20,7 +20,9 @@ A command is a **markdown file** that serves as a detailed instruction set for a
 3. Sends the entire document as a prompt to the AI
 4. The AI follows the instructions and produces output
 
-**Commands are prompts, not code.** They guide AI behavior through clear instructions.
+**Most commands are prompts, not code.** They guide AI behavior through clear instructions. (One
+exception: a command with a `run:` directive is executed deterministically with no AI — see
+[AI-less Commands](#ai-less-commands-deterministic-run) below.)
 
 ---
 
@@ -55,6 +57,68 @@ argument-hint: <expected-input-format>
 |-------|----------|---------|
 | `description` | Recommended | Shown in `/commands` list and workflow routing |
 | `argument-hint` | Optional | Tells users what input to provide |
+| `run` | Optional | Makes the command **AI-less**: a shell snippet run deterministically instead of prompting the AI (see below) |
+| `timeout` | Optional | For `run:` commands, the subprocess timeout in ms (default 60000) |
+
+---
+
+## AI-less Commands (deterministic `run:`)
+
+Most commands are prompts for an AI agent. Sometimes you want the opposite: a slash command
+that just **runs a script and returns its output**, with no agent, no session, and no
+non-determinism — a config toggle, a status query, a canned report. Declare a `run:` directive in
+the frontmatter and the command becomes **AI-less**:
+
+```markdown
+---
+description: Show disk usage of the repo
+run: du -sh . 2>/dev/null
+---
+```
+
+When a chat message is a slash command whose name matches such a file, Archon executes the `run:`
+snippet directly and returns its **stdout** as the reply. Nothing is sent to an AI. A command file
+*without* `run:` keeps the normal prompt behavior, so this is purely opt-in.
+
+### How it runs
+
+- The snippet runs via `bash -c`, with the working directory set to the project root (or the
+  command file's directory when there is no project).
+- The caller's arguments are available **both** as positional parameters (`"$@"`, `$1`, `$2`, …)
+  **and** as `$ARGUMENTS` (the whole argument string). The arguments are passed as data, never
+  re-interpreted as shell — so `/mycmd "$(rm -rf /)"` is safe; the text is a literal argument.
+  A `run:` that wants the arguments must forward them explicitly (e.g. `mytool "$@"`).
+- `$ARCHON_COMMAND_DIR` is set to the command file's directory, so a command can call a sibling
+  script: `run: bash "$ARCHON_COMMAND_DIR/report.sh" "$@"`.
+- A non-zero exit becomes an error reply carrying the command's stderr. Output is capped (1 MB)
+  and the subprocess is killed after `timeout` ms (default 60000).
+
+### Where they live
+
+AI-less commands are discovered on demand from the same places as other commands, **repo first,
+then home**:
+
+1. `<project>/.archon/commands/<name>.md` — project-scoped (committed with the repo).
+2. `~/.archon/commands/<name>.md` — home-scoped, available in every project.
+
+### Example
+
+```markdown
+---
+description: Toggle a project setting without spinning up an agent
+argument-hint: <key> <on|off>
+run: bash "$ARCHON_COMMAND_DIR/set-flag.sh" "$@"
+---
+```
+
+Typing `/toggle feature-x on` runs `set-flag.sh feature-x on` and posts its output back — instantly,
+deterministically, with no model call.
+
+### Security
+
+A `run:` snippet is trusted content (it lives in the repo or your home dir, same trust level as a
+workflow's `script:` nodes). Only the **arguments** come from the chat, and they are always passed
+as inert positional data. Treat a command file's `run:` exactly as you would any script you commit.
 
 ---
 
